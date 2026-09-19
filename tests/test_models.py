@@ -23,6 +23,7 @@ from arabic_dexlit.model.detector import (  # noqa: E402
     SpanDetector,
     script_of,
 )
+from arabic_dexlit.model.lexicon import OOV, OOV_ID, Lexicon  # noqa: E402
 from arabic_dexlit.schema import IGNORE_INDEX, NUM_TAGS  # noqa: E402
 
 
@@ -106,6 +107,65 @@ def test_char_roundtrip():
     for text in ["intern", "AI", "ahmed@gmail.com", "Orange Innovation"]:
         ids = encode_chars(text, 48)
         assert decode_ids(ids) == text
+
+
+def test_lexicon_roundtrip_and_oov():
+    """OOV must be id 0 and unseen words must map to it, so the head can abstain."""
+    lex = Lexicon.from_spans(["meeting", "meeting", "offer", "offer", "rare"], min_count=2)
+    assert lex.itos[OOV_ID] == OOV
+    assert lex.get("meeting") != OOV_ID
+    assert lex.get("Meeting") == lex.get("meeting")   # case-insensitive fallback
+    assert lex.get("rare") == OOV_ID                  # dropped by min_count
+    assert lex.get("Kubernetes") == OOV_ID            # never seen
+
+
+def test_lexicon_save_load(tmp_path=None):
+    import tempfile, pathlib
+    lex = Lexicon.from_spans(["a", "a", "b", "b"], min_count=2)
+    with tempfile.TemporaryDirectory() as d:
+        p = pathlib.Path(d) / "lex.json"
+        lex.save(p)
+        back = Lexicon.load(p)
+    assert back.itos == lex.itos
+    assert back.get("a") == lex.get("a")
+
+
+def test_word_head_trains_and_predicts():
+    """The word head must learn a closed-set mapping and expose confidences."""
+    lex = Lexicon.from_spans(["intern", "intern", "offer", "offer"], min_count=2)
+    cfg = ConverterConfig(d_model=64, nhead=2, num_encoder_layers=1,
+                          num_decoder_layers=1, dim_feedforward=128,
+                          use_word_head=True, lexicon_size=len(lex))
+    m = SpanConverter(cfg)
+    assert m.word_head is not None
+
+    src = torch.randint(4, 50, (4, 8))
+    cat = torch.zeros(4, dtype=torch.long)
+    tgt_in = torch.randint(4, 50, (4, 6))
+    tgt_out = torch.randint(4, 50, (4, 6))
+    wid = torch.tensor([1, 2, 1, 2])
+
+    out = m(src, cat, tgt_in, tgt_out, word_ids=wid)
+    assert "word_logits" in out and "word_loss" in out and "char_loss" in out
+    assert out["word_logits"].shape == (4, len(lex))
+    out["loss"].backward()
+
+    idx, conf = m.predict_words(src, cat)
+    assert idx.shape == (4,) and conf.shape == (4,)
+    assert bool(((conf >= 0) & (conf <= 1)).all())
+
+
+def test_word_head_can_be_disabled():
+    """With the head off the model must still train as a pure char converter."""
+    cfg = ConverterConfig(d_model=64, nhead=2, num_encoder_layers=1,
+                          num_decoder_layers=1, dim_feedforward=128,
+                          use_word_head=False)
+    m = SpanConverter(cfg)
+    assert m.word_head is None
+    out = m(torch.randint(4, 50, (2, 8)), torch.zeros(2, dtype=torch.long),
+            torch.randint(4, 50, (2, 5)), torch.randint(4, 50, (2, 5)))
+    assert "word_logits" not in out
+    assert out["loss"].requires_grad
 
 
 def test_converter_is_small():

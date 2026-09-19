@@ -211,7 +211,7 @@ def train_detector(cfg: dict) -> dict:
                 out = model(**batch)
                 loss = out["loss"] / accum
             scaler.scale(loss).backward()
-            running += float(out["loss"])
+            running += out["loss"].detach().item()
 
             if (i + 1) % accum == 0:
                 scaler.unscale_(optim)

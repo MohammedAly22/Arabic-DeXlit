@@ -19,6 +19,21 @@ dropout: 0.1
 max_src_len: 48
 max_tgt_len: 40
 
+# --- hybrid word head ---
+# Measured on this corpus: 1.25M spans reduce to ~15K unique English targets,
+# the top 1,000 covering 93% of test spans. A closed-vocabulary head answers
+# those exactly (a whole dictionary word -- misspelling is impossible) while the
+# character decoder keeps the open vocabulary brand names and URLs need.
+use_word_head: true
+lexicon_max_size: 20000
+# Targets seen once are usually typos or one-off entities; the character decoder
+# handles those better than a softmax slot trained on a single example.
+lexicon_min_count: 2
+word_loss_weight: 1.0
+# Below this probability the word head abstains and the characters decide.
+# Raise it to be more conservative (more falls through to characters).
+word_confidence: 0.90
+
 # --- optimisation ---
 epochs: 8
 batch_size: 256

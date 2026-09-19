@@ -26,8 +26,14 @@ from ..model.converter import (
     SpanConverter,
     decode_ids,
 )
+from ..model.lexicon import OOV_ID, Lexicon
 from ..schema import CATEGORIES
-from .dataset import ConverterDataset, collate_converter, read_jsonl
+from .dataset import (
+    ConverterDataset,
+    balanced_subset,
+    collate_converter,
+    read_jsonl,
+)
 from .metrics import ConverterMetrics
 from .train_detector import pick_amp
 
@@ -43,6 +49,7 @@ def evaluate(
     amp: bool,
     amp_dtype: torch.dtype,
     max_batches: int | None = None,
+    lexicon: "Lexicon | None" = None,
 ) -> tuple[dict, list[tuple[str, str, str]]]:
     model.eval()
     m = ConverterMetrics()
@@ -54,11 +61,25 @@ def evaluate(
             break
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp):
-            out = model(batch["src"], batch["category"], batch["tgt_in"], batch["tgt_out"])
+            out = model(
+                batch["src"], batch["category"], batch["tgt_in"],
+                batch["tgt_out"], word_ids=batch.get("word_ids"),
+            )
         losses.append(float(out["loss"]))
 
         gen = model.greedy_decode(batch["src"], batch["category"])
         preds = [decode_ids(r) for r in gen.cpu().tolist()]
+
+        # Hybrid: where the word head is confident and does not predict OOV, its
+        # answer is a whole dictionary word and therefore cannot be misspelled.
+        # Everything else falls back to the characters, keeping the open
+        # vocabulary that brand names and URLs need.
+        if lexicon is not None and model.word_head is not None:
+            widx, wconf = model.predict_words(batch["src"], batch["category"])
+            thr = model.cfg.word_confidence
+            for j, (wi, wc) in enumerate(zip(widx.cpu().tolist(), wconf.cpu().tolist())):
+                if wi != OOV_ID and wc >= thr:
+                    preds[j] = lexicon.word(wi)
         golds = [decode_ids(r) for r in batch["tgt_out"].cpu().tolist()]
         cats = [_ID2CAT.get(int(c), "CS") for c in batch["category"].cpu().tolist()]
         m.update(preds, golds, cats)
@@ -93,17 +114,48 @@ def train_converter(cfg: dict) -> dict:
         max_tgt_len=cfg.get("max_tgt_len", 40),
     )
 
+    # The caps are counted in *sentences*, matching stage 1, and applied before
+    # spans are flattened. Without this a --smoke run looks capped at 400 but
+    # actually trains on every span those sentences contain -- ~72K pairs and
+    # 9,000 steps, which is not a smoke test.
+    train_rows = balanced_subset(
+        read_jsonl(data_dir / "train.jsonl"), cfg.get("max_train_examples")
+    )
+    val_rows = balanced_subset(
+        read_jsonl(data_dir / "validation.jsonl"), cfg.get("max_eval_examples")
+    )
     train_ds = ConverterDataset(
-        read_jsonl(data_dir / "train.jsonl"),
-        max_src_len=ccfg.max_src_len,
-        max_tgt_len=ccfg.max_tgt_len,
+        train_rows, max_src_len=ccfg.max_src_len, max_tgt_len=ccfg.max_tgt_len
     )
     val_ds = ConverterDataset(
-        read_jsonl(data_dir / "validation.jsonl"),
-        max_src_len=ccfg.max_src_len,
-        max_tgt_len=ccfg.max_tgt_len,
+        val_rows, max_src_len=ccfg.max_src_len, max_tgt_len=ccfg.max_tgt_len
     )
-    print(f"[data] span pairs: train={len(train_ds):,} val={len(val_ds):,}")
+
+    # The lexicon is built from TRAIN targets only -- building it from the whole
+    # corpus would leak test vocabulary into the model's output space.
+    lexicon = None
+    if cfg.get("use_word_head", True):
+        lexicon = Lexicon.from_spans(
+            train_ds.targets(),
+            max_size=cfg.get("lexicon_max_size", 20000),
+            min_count=cfg.get("lexicon_min_count", 2),
+        )
+        ccfg.use_word_head = True
+        ccfg.lexicon_size = len(lexicon)
+        ccfg.word_confidence = cfg.get("word_confidence", 0.90)
+        train_ds.lexicon = lexicon
+        val_ds.lexicon = lexicon
+        print(
+            f"[lex  ] {len(lexicon):,} words | train coverage "
+            f"{lexicon.coverage(train_ds.targets()):.1%} | val coverage "
+            f"{lexicon.coverage(val_ds.targets()):.1%}"
+        )
+    else:
+        ccfg.use_word_head = False
+    print(
+        f"[data] sentences: train={len(train_rows):,} val={len(val_rows):,} | "
+        f"span pairs: train={len(train_ds):,} val={len(val_ds):,}"
+    )
     if not len(train_ds):
         raise SystemExit("no span pairs found -- build the dataset first")
 
@@ -169,7 +221,10 @@ def train_converter(cfg: dict) -> dict:
         for batch in train_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp):
-                out = model(batch["src"], batch["category"], batch["tgt_in"], batch["tgt_out"])
+                out = model(
+                    batch["src"], batch["category"], batch["tgt_in"],
+                    batch["tgt_out"], word_ids=batch.get("word_ids"),
+                )
                 loss = out["loss"]
             optim.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -179,7 +234,7 @@ def train_converter(cfg: dict) -> dict:
             scaler.update()
             sched.step()
             step += 1
-            running += float(loss)
+            running += loss.detach().item()
 
             if step % log_every == 0:
                 avg = running / log_every
@@ -196,7 +251,7 @@ def train_converter(cfg: dict) -> dict:
             if step % eval_every == 0 or step == total_steps:
                 res, samples = evaluate(
                     model, val_loader, device, amp=amp, amp_dtype=amp_dtype,
-                    max_batches=cfg.get("eval_max_batches", 20),
+                    max_batches=cfg.get("eval_max_batches", 20), lexicon=lexicon,
                 )
                 print(
                     f"[eval ] step {step} exact {res['exact_match']:.4f} "
@@ -219,6 +274,8 @@ def train_converter(cfg: dict) -> dict:
                 if res["exact_match"] > best_em:
                     best_em = res["exact_match"]
                     save_converter(model, ccfg, out_dir, res)
+                    if lexicon is not None:
+                        lexicon.save(out_dir / "lexicon.json")
                     print(f"[ckpt ] new best exact-match {best_em:.4f}")
 
     print(f"[done ] {time.time()-t0:.0f}s  best exact-match {best_em:.4f}")

@@ -144,9 +144,11 @@ class ConverterDataset(Dataset):
         max_src_len: int = 48,
         max_tgt_len: int = 40,
         dedupe: bool = True,
+        lexicon=None,
     ) -> None:
         self.max_src_len = max_src_len
         self.max_tgt_len = max_tgt_len
+        self.lexicon = lexicon
         self.pairs: list[tuple[str, str, int]] = []
         seen: set[tuple[str, str, str]] = set()
         for row in rows:
@@ -170,13 +172,22 @@ class ConverterDataset(Dataset):
         src, tgt, cat = self.pairs[i]
         src_ids = encode_chars(src, self.max_src_len)
         tgt_ids = encode_chars(tgt, self.max_tgt_len)
-        return {
+        item = {
             "src": src_ids,
             "category": cat,
             # Teacher forcing: the decoder reads <bos>+y and predicts y+<eos>.
             "tgt_in": [BOS_ID] + tgt_ids[:-1],
             "tgt_out": tgt_ids,
         }
+        if self.lexicon is not None:
+            # 0 (OOV) is a real class here, not a padding value: the word head
+            # must learn to abstain on targets outside the lexicon.
+            item["word_id"] = self.lexicon.get(tgt)
+        return item
+
+    def targets(self) -> list[str]:
+        """All gold targets, for building a lexicon."""
+        return [t for _, t, _ in self.pairs]
 
 
 def collate_converter(batch: list[dict]) -> dict:
@@ -188,12 +199,15 @@ def collate_converter(batch: list[dict]) -> dict:
             [b[key] + [PAD_ID] * (n - len(b[key])) for b in batch], dtype=torch.long
         )
 
-    return {
+    out = {
         "src": pad("src", ns),
         "category": torch.tensor([b["category"] for b in batch], dtype=torch.long),
         "tgt_in": pad("tgt_in", nt),
         "tgt_out": pad("tgt_out", nt),
     }
+    if "word_id" in batch[0]:
+        out["word_ids"] = torch.tensor([b["word_id"] for b in batch], dtype=torch.long)
+    return out
 
 
 def balanced_subset(

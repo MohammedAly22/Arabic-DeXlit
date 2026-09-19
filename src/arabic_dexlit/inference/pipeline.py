@@ -29,6 +29,7 @@ from ..model.converter import (
     encode_chars,
 )
 from ..model.detector import DetectorConfig, SpanDetector, script_of
+from ..model.lexicon import OOV_ID, Lexicon
 from ..schema import ID2TAG, OUTSIDE, spans_from_tags
 
 _WS = re.compile(r"\s+")
@@ -62,6 +63,7 @@ class DeXlitPipeline:
         device: torch.device | str = "cpu",
         copy_threshold: float | None = None,
         max_length: int = 256,
+        lexicon: Lexicon | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.detector = detector.to(self.device).eval()
@@ -69,6 +71,7 @@ class DeXlitPipeline:
         self.tok = tokenizer
         self.copy_threshold = copy_threshold
         self.max_length = max_length
+        self.lexicon = lexicon
 
     # --- loading ----------------------------------------------------------
     @classmethod
@@ -97,7 +100,13 @@ class DeXlitPipeline:
             )
             conv = SpanConverter(ccfg)
             conv.load_state_dict(torch.load(cpath, map_location="cpu"))
-        return cls(det, conv, tok, device=device, copy_threshold=copy_threshold)
+
+        lex_path = path / "lexicon.json"
+        lexicon = Lexicon.load(lex_path) if lex_path.exists() else None
+        return cls(
+            det, conv, tok, device=device, copy_threshold=copy_threshold,
+            lexicon=lexicon,
+        )
 
     # --- detection --------------------------------------------------------
     @torch.no_grad()
@@ -146,8 +155,20 @@ class DeXlitPipeline:
         cat_t = torch.tensor(
             [CATEGORY_IDS.get(c, 0) for c in categories], dtype=torch.long
         )
-        gen = self.converter.greedy_decode(src_t.to(self.device), cat_t.to(self.device))
-        return [decode_ids(r) for r in gen.cpu().tolist()]
+        src_t, cat_t = src_t.to(self.device), cat_t.to(self.device)
+        gen = self.converter.greedy_decode(src_t, cat_t)
+        out = [decode_ids(r) for r in gen.cpu().tolist()]
+
+        # Prefer the word head wherever it is confident: its output is a whole
+        # lexicon entry, so it cannot be a misspelling. The character decoder
+        # covers the rest -- unseen brand names, URLs, emails.
+        if self.lexicon is not None and getattr(self.converter, "word_head", None):
+            widx, wconf = self.converter.predict_words(src_t, cat_t)
+            thr = self.converter.cfg.word_confidence
+            for j, (wi, wc) in enumerate(zip(widx.cpu().tolist(), wconf.cpu().tolist())):
+                if wi != OOV_ID and wc >= thr:
+                    out[j] = self.lexicon.word(wi)
+        return out
 
     # --- end to end -------------------------------------------------------
     def __call__(self, text: str) -> Prediction:

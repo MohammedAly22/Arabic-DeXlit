@@ -99,6 +99,17 @@ class ConverterConfig:
     max_src_len: int = 48
     max_tgt_len: int = 40
     num_categories: int = field(default=len(CATEGORIES))
+    # --- hybrid word head ---------------------------------------------------
+    # Measured on the corpus: 1.25M spans reduce to 15,326 unique targets, the
+    # top 1,000 covering 93% of test spans. A closed-vocabulary head answers
+    # those exactly -- a whole dictionary word, so misspelling is impossible --
+    # while the character decoder keeps the open vocabulary that brand names,
+    # unseen jargon and URLs require.
+    use_word_head: bool = True
+    lexicon_size: int = 0          # filled in when the lexicon is built
+    word_loss_weight: float = 1.0
+    # Below this probability the word head abstains and the characters decide.
+    word_confidence: float = 0.90
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -150,6 +161,41 @@ class SpanConverter(nn.Module):
         self.out = nn.Linear(cfg.d_model, cfg.vocab_size)
         self.scale = cfg.d_model ** 0.5
 
+        # Word head: mean-pooled encoder state -> softmax over the lexicon.
+        # It reads the encoder only (no decoding), so it costs one matmul and
+        # removes the autoregressive loop entirely for the spans it answers.
+        if cfg.use_word_head and cfg.lexicon_size > 0:
+            self.word_head = nn.Sequential(
+                nn.Linear(cfg.d_model, cfg.d_model),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.d_model, cfg.lexicon_size),
+            )
+        else:
+            self.word_head = None
+
+    def encode_memory(
+        self, src: torch.Tensor, cat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the encoder once, returning memory and its padding mask."""
+        src_pad = torch.cat(
+            [torch.zeros(src.size(0), 1, dtype=torch.bool, device=src.device),
+             src == PAD_ID],
+            dim=1,
+        )
+        memory = self.transformer.encoder(
+            self._encode(src, cat), src_key_padding_mask=src_pad
+        )
+        return memory, src_pad
+
+    def word_logits(self, memory: torch.Tensor, src_pad: torch.Tensor) -> torch.Tensor:
+        """Lexicon logits from masked-mean-pooled encoder memory."""
+        if self.word_head is None:
+            raise RuntimeError("word head is disabled on this model")
+        keep = (~src_pad).unsqueeze(-1).to(memory.dtype)
+        pooled = (memory * keep).sum(1) / keep.sum(1).clamp(min=1.0)
+        return self.word_head(pooled)
+
     def _encode(self, src: torch.Tensor, cat: torch.Tensor) -> torch.Tensor:
         x = self.embed(src) * self.scale
         # The category is prepended as a pseudo-token so every encoder position
@@ -163,6 +209,7 @@ class SpanConverter(nn.Module):
         cat: torch.Tensor,
         tgt_in: torch.Tensor,
         tgt_out: torch.Tensor | None = None,
+        word_ids: torch.Tensor | None = None,
     ) -> dict:
         src_pad = torch.cat(
             [torch.zeros(src.size(0), 1, dtype=torch.bool, device=src.device),
@@ -184,14 +231,46 @@ class SpanConverter(nn.Module):
         )
         logits = self.out(h)
         res = {"logits": logits}
+
+        # The word head reads the encoder half of the same forward pass, so
+        # training both heads costs one extra matmul, not a second model.
+        if self.word_head is not None:
+            memory = self.transformer.encoder(
+                mem_in, src_key_padding_mask=src_pad
+            )
+            res["word_logits"] = self.word_logits(memory, src_pad)
+
         if tgt_out is not None:
-            res["loss"] = F.cross_entropy(
+            char_loss = F.cross_entropy(
                 logits.reshape(-1, self.cfg.vocab_size),
                 tgt_out.reshape(-1),
                 ignore_index=PAD_ID,
                 label_smoothing=0.1,
             )
+            res["char_loss"] = char_loss.detach()
+            loss = char_loss
+            if self.word_head is not None and word_ids is not None:
+                # OOV spans are kept in this loss (not ignored): the head must
+                # learn to *predict* OOV so it abstains rather than guessing a
+                # wrong lexicon word for a brand name it has never seen.
+                word_loss = F.cross_entropy(res["word_logits"], word_ids)
+                res["word_loss"] = word_loss.detach()
+                loss = loss + self.cfg.word_loss_weight * word_loss
+            res["loss"] = loss
         return res
+
+    @torch.no_grad()
+    def predict_words(
+        self, src: torch.Tensor, cat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Word-head prediction: ``(word_id, probability)`` per span.
+
+        No decoding loop -- one encoder pass and a softmax.
+        """
+        memory, src_pad = self.encode_memory(src, cat)
+        probs = self.word_logits(memory, src_pad).softmax(-1)
+        conf, idx = probs.max(-1)
+        return idx, conf
 
     @torch.no_grad()
     def greedy_decode(
