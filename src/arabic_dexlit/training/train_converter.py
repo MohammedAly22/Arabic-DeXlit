@@ -116,16 +116,10 @@ def train_converter(cfg: dict) -> dict:
     out_dir = Path(cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ccfg = ConverterConfig(
-        d_model=cfg.get("d_model", 256),
-        nhead=cfg.get("nhead", 4),
-        num_encoder_layers=cfg.get("num_encoder_layers", 3),
-        num_decoder_layers=cfg.get("num_decoder_layers", 3),
-        dim_feedforward=cfg.get("dim_feedforward", 768),
-        dropout=cfg.get("dropout", 0.1),
-        max_src_len=cfg.get("max_src_len", 48),
-        max_tgt_len=cfg.get("max_tgt_len", 40),
-    )
+    # Built straight from the config dict so ConverterConfig's own defaults are
+    # the single source of truth. Repeating them here as .get() fallbacks meant
+    # an older YAML silently pinned the model to the previous architecture.
+    ccfg = ConverterConfig.from_dict(cfg)
 
     # The caps are counted in *sentences*, matching stage 1, and applied before
     # spans are flattened. Without this a --smoke run looks capped at 400 but
@@ -138,10 +132,12 @@ def train_converter(cfg: dict) -> dict:
         read_jsonl(data_dir / "validation.jsonl"), cfg.get("max_eval_examples")
     )
     train_ds = ConverterDataset(
-        train_rows, max_src_len=ccfg.max_src_len, max_tgt_len=ccfg.max_tgt_len
+        train_rows, max_src_len=ccfg.max_src_len, max_tgt_len=ccfg.max_tgt_len,
+        context_window=ccfg.context_window,
     )
     val_ds = ConverterDataset(
-        val_rows, max_src_len=ccfg.max_src_len, max_tgt_len=ccfg.max_tgt_len
+        val_rows, max_src_len=ccfg.max_src_len, max_tgt_len=ccfg.max_tgt_len,
+        context_window=ccfg.context_window,
     )
 
     # The lexicon is built from TRAIN targets only -- building it from the whole

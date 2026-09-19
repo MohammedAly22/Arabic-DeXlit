@@ -60,12 +60,17 @@ PAD, BOS, EOS, UNK = "<pad>", "<bos>", "<eos>", "<unk>"
 SPECIALS = [PAD, BOS, EOS, UNK]
 PAD_ID, BOS_ID, EOS_ID, UNK_ID = 0, 1, 2, 3
 
+# Delimiters that mark the span to convert inside its surrounding context.
+# Single characters (not multi-char tags) so the character tokenizer handles
+# them naturally, and guillemets because they never occur in Arabic ASR output.
+SPAN_OPEN, SPAN_CLOSE = "‹", "›"
+
 # Arabic letters actually produced by ASR, plus the Latin output alphabet.
 _ARABIC_CHARS = "ابتثجحخدذرزسشصضطظعغفقكلمنهوىيئءأإآةپچڤگژ"
 _ARABIC_MARKS = "ًٌٍَُِّْـ"
 _LATIN_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _DIGITS = "0123456789"
-_PUNCT = " .,!?-_@/:'&+#%()"
+_PUNCT = " .,!?-_@/:'&+#%()" + SPAN_OPEN + SPAN_CLOSE
 
 
 def build_vocab() -> tuple[dict[str, int], dict[int, str]]:
@@ -110,14 +115,23 @@ def decode_ids(ids: list[int]) -> str:
 @dataclass
 class ConverterConfig:
     vocab_size: int = VOCAB_SIZE
-    d_model: int = 256
-    nhead: int = 4
-    num_encoder_layers: int = 3
-    num_decoder_layers: int = 3
-    dim_feedforward: int = 768
+    # Capacity. The first trained model (d=256, 3+3 layers, ~9M params) plateaued
+    # at 33% exact match with errors like "meting"/"frends" -- near-misses that
+    # indicate too little capacity to settle on exact spellings, not a broken
+    # objective. This is ~53M: six times larger, still far smaller than a
+    # pretrained byte model, and it runs only on flagged spans.
+    d_model: int = 512
+    nhead: int = 8
+    num_encoder_layers: int = 6
+    num_decoder_layers: int = 6
+    dim_feedforward: int = 2048
     dropout: float = 0.1
-    max_src_len: int = 48
+    # Source length now has to hold the context window, not just the span.
+    max_src_len: int = 96
     max_tgt_len: int = 40
+    # Words of surrounding context given to the converter on each side of the
+    # span. 0 reproduces the old isolated-span behaviour.
+    context_window: int = 3
     num_categories: int = field(default=len(CATEGORIES))
     # --- hybrid word head ---------------------------------------------------
     # Measured on the corpus: 1.25M spans reduce to 15,326 unique targets, the

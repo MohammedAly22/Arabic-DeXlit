@@ -65,17 +65,23 @@ there is anything to fix.
 Arabic-DeXlit splits the problem in two.
 
 <div align="center">
-<img src="assets/two-stages.png" alt="Stage 1 tags every token O or B-/I-category; if all tags are O the input string is returned untouched and stage 2 never runs; otherwise a ~5M-param character transformer converts only the flagged spans" width="95%">
+<img src="assets/two-stages.png" alt="Stage 1 tags every token O or B-/I-category; if all tags are O the input string is returned untouched and stage 2 never runs; otherwise a ~53M-param context-aware converter rewrites only the flagged spans" width="95%">
 </div>
 
 **1️⃣ Stage 1 — the detector.** A token classifier over
 [MARBERTv2](https://huggingface.co/UBC-NLP/MARBERTv2), chosen because it is pretrained on
 *dialectal* Arabic rather than MSA. Each token gets one tag. `O` means *copy this verbatim*.
 
-**2️⃣ Stage 2 — the converter.** A tiny character-level transformer mapping Arabic characters to
-Latin. Character-level because the mapping is **phonetic, not lexical**: a word-level model could
-only emit English it had already seen, whereas the real long tail here is company names, products
-and jargon.
+**2️⃣ Stage 2 — the converter.** A ~53M-parameter **context-aware** model with two heads:
+
+- a **word head** over a ~15K-word lexicon, which emits a whole dictionary word (so it cannot
+  misspell) and runs no decode loop at all;
+- a **character head** for everything else, keeping the vocabulary open for brand names and URLs.
+
+It sees the span **inside its surrounding sentence**, marked off with delimiters:
+`مع ‹ ال › سبيتش ايه اي`. Without that context a span is ambiguous in isolation — an early model
+converted the Arabic article `ال` into `"la"` simply because it could not see the neighbours that
+make it an article.
 
 ### 💡 Why this design earns its keep
 

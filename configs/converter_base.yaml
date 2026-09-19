@@ -10,14 +10,24 @@ output_dir: outputs/detector   # saved alongside the detector for one-dir loadin
 # --- architecture ---
 # ~5M parameters: big enough for phonetic mapping, small enough that inference
 # over a few short spans is negligible next to the encoder pass.
-d_model: 256
-nhead: 4
-num_encoder_layers: 3
-num_decoder_layers: 3
-dim_feedforward: 768
+# The first trained model (d=256, 3+3, ~9M params) plateaued at 33% exact match
+# with near-miss errors ("meting", "frends") -- a capacity symptom, not a broken
+# objective. This is ~53M: six times larger, still far smaller than a pretrained
+# byte model, and it only ever runs on flagged spans.
+d_model: 512
+nhead: 8
+num_encoder_layers: 6
+num_decoder_layers: 6
+dim_feedforward: 2048
 dropout: 0.1
-max_src_len: 48
+max_src_len: 96
 max_tgt_len: 40
+
+# Words of surrounding context on each side of the span. Without this the
+# converter sees a span in isolation and cannot tell the Arabic article ال from
+# a transliterated English word -- the observed failure was ال -> "la".
+# Set to 0 for the old isolated-span behaviour.
+context_window: 3
 
 # --- hybrid word head ---
 # Measured on this corpus: 1.25M spans reduce to ~15K unique English targets,
@@ -35,9 +45,9 @@ word_loss_weight: 1.0
 word_confidence: 0.90
 
 # --- optimisation ---
-epochs: 8
-batch_size: 256
-eval_batch_size: 256
+epochs: 15
+batch_size: 192
+eval_batch_size: 192
 learning_rate: 3.0e-4
 weight_decay: 0.01
 warmup_ratio: 0.05

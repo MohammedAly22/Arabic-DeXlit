@@ -145,6 +145,32 @@ def train_detector(cfg: dict) -> dict:
         pin_memory=device.type == "cuda",
     )
 
+    # Inverse-frequency weights per category, computed from the training rows.
+    # The corpus is ~99% plain CS, so ACRONYM / EMAIL / ENTITY are otherwise
+    # under-trained to the point of firing spuriously on each other.
+    cat_w = None
+    if cfg.get("auto_category_weights", True):
+        from collections import Counter
+
+        from ..schema import category_of
+
+        counts: Counter = Counter()
+        for r in train_rows:
+            for t in r["tags"]:
+                c = category_of(t)
+                if c:
+                    counts[c] += 1
+        if counts:
+            most = max(counts.values())
+            cap = float(cfg.get("max_category_weight", 8.0))
+            # sqrt tempers the imbalance: raw inverse frequency would put a
+            # ~700x weight on ENTITY and destabilise training.
+            cat_w = {
+                c: min(cap, (most / n) ** 0.5) for c, n in counts.items()
+            }
+            print(f"[weights] per-category: "
+                  + ", ".join(f"{c}={w:.2f}" for c, w in sorted(cat_w.items())))
+
     dcfg = DetectorConfig(
         encoder_name=cfg["encoder_name"],
         dropout=cfg.get("dropout", 0.1),
@@ -153,6 +179,7 @@ def train_detector(cfg: dict) -> dict:
         copy_gate_weight=cfg.get("copy_gate_weight", 0.3),
         positive_weight=cfg.get("positive_weight", 2.0),
         freeze_encoder_layers=cfg.get("freeze_encoder_layers", 0),
+        category_weights=cat_w,
     )
     model = SpanDetector(dcfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())

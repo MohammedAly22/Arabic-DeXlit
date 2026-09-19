@@ -24,6 +24,8 @@ from ..model.converter import (
     CATEGORY_IDS,
     EOS_ID,
     PAD_ID,
+    SPAN_CLOSE,
+    SPAN_OPEN,
     encode_chars,
 )
 from ..model.detector import script_of
@@ -130,6 +132,27 @@ def collate_detector(batch: list[dict], pad_id: int = 0) -> dict:
     }
 
 
+def build_context(
+    tokens: list[str], start: int, end: int, window: int = 3
+) -> str:
+    """Wrap a span in its surrounding words, with explicit boundary markers.
+
+    ``["عندي","ميتينج","مع","ال","مانجر"], 1, 2`` ->
+    ``"عندي ‹ ميتينج › مع ال مانجر"``
+
+    The guillemets mark exactly which tokens must be converted; everything else
+    is there only to disambiguate. This is what lets the model learn that a bare
+    Arabic ال in context is the article (leave it) rather than a transliteration
+    of "la", which it cannot possibly know from the span alone.
+    """
+    if window <= 0:
+        return " ".join(tokens[start:end])
+    left = tokens[max(0, start - window) : start]
+    right = tokens[end : end + window]
+    span = tokens[start:end]
+    return " ".join([*left, SPAN_OPEN, *span, SPAN_CLOSE, *right])
+
+
 class ConverterDataset(Dataset):
     """Span-level pairs: Arabic-script characters -> English characters.
 
@@ -145,7 +168,9 @@ class ConverterDataset(Dataset):
         max_tgt_len: int = 40,
         dedupe: bool = True,
         lexicon=None,
+        context_window: int = 3,
     ) -> None:
+        self.context_window = context_window
         self.max_src_len = max_src_len
         self.max_tgt_len = max_tgt_len
         self.lexicon = lexicon
@@ -154,16 +179,23 @@ class ConverterDataset(Dataset):
         for row in rows:
             toks = row["src_tokens"]
             for span in row.get("spans", []):
-                src = " ".join(toks[span["start"] : span["end"]])
+                start, end = span["start"], span["end"]
+                src = " ".join(toks[start:end])
                 tgt = span["target"]
                 cat = span["category"]
                 if not src or not tgt:
                     continue
-                key = (src, tgt, cat)
+                # Surrounding words, marked off so the model can tell context
+                # from the span it must convert. Without this the converter sees
+                # a span in isolation and cannot tell Arabic ال ("the") from a
+                # transliterated English word -- the observed failure was
+                # ال -> "la", و -> "we", ان -> "na".
+                ctx = build_context(toks, start, end, self.context_window)
+                key = (ctx, tgt, cat)
                 if dedupe and key in seen:
                     continue
                 seen.add(key)
-                self.pairs.append((src, tgt, CATEGORY_IDS.get(cat, 0)))
+                self.pairs.append((ctx, tgt, CATEGORY_IDS.get(cat, 0)))
 
     def __len__(self) -> int:
         return len(self.pairs)

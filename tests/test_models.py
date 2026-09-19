@@ -168,10 +168,29 @@ def test_word_head_can_be_disabled():
     assert out["loss"].requires_grad
 
 
-def test_converter_is_small():
-    """The whole point is a tiny stage 2 -- guard against config drift."""
+def test_converter_stays_small_enough():
+    """Stage 2 must stay far below a pretrained byte model (~300M).
+
+    It was raised from ~9M to ~53M after the first model plateaued at 33% exact
+    match, but the low-latency design depends on it not growing without limit.
+    """
     m = SpanConverter(ConverterConfig())
-    assert m.num_parameters() < 12_000_000, m.num_parameters()
+    assert m.num_parameters() < 80_000_000, m.num_parameters()
+
+
+def test_context_window_marks_the_span():
+    """Context must mark which tokens to convert, and survive encoding."""
+    from arabic_dexlit.model.converter import SPAN_CLOSE, SPAN_OPEN
+    from arabic_dexlit.training.dataset import build_context
+
+    toks = ["a", "b", "c", "d", "e"]
+    ctx = build_context(toks, 2, 3, window=1)
+    assert ctx == f"b {SPAN_OPEN} c {SPAN_CLOSE} d"
+    # window=0 reproduces the old isolated-span behaviour exactly
+    assert build_context(toks, 2, 3, window=0) == "c"
+    # markers must be real vocabulary, not <unk>
+    from arabic_dexlit.model.converter import STOI
+    assert SPAN_OPEN in STOI and SPAN_CLOSE in STOI
 
 
 if __name__ == "__main__":

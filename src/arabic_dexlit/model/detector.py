@@ -96,6 +96,12 @@ class DetectorConfig:
     # Class weight applied to non-O tags. Spans are a small minority of tokens,
     # so without this the model can score well by predicting O everywhere.
     positive_weight: float = 2.0
+    # Per-category weighting on top of that. The corpus is 98.9% plain CS, with
+    # ACRONYM at 0.66%, EMAIL 0.32% and ENTITY 0.14%; a uniform positive weight
+    # leaves the rare categories badly under-trained, which showed up as an
+    # ENTITY ("Orange Innovation Egypt") being mis-tagged EMAIL and converted to
+    # "info@gening". Weights are computed from the data at build time.
+    category_weights: dict | None = None
     freeze_encoder_layers: int = 0
 
     def to_dict(self) -> dict:
@@ -134,9 +140,17 @@ class SpanDetector(nn.Module):
         if cfg.use_copy_gate:
             self.copy_head = nn.Linear(feat, 1)
 
-        # Weight non-O classes up so rare spans are not drowned out by O.
+        # Weight non-O classes up so rare spans are not drowned out by O, then
+        # scale each category by its own rarity.
         w = torch.ones(cfg.num_tags)
         w[1:] = cfg.positive_weight
+        if cfg.category_weights:
+            from ..schema import ID2TAG, category_of
+
+            for i in range(1, cfg.num_tags):
+                cat = category_of(ID2TAG[i])
+                if cat and cat in cfg.category_weights:
+                    w[i] = cfg.positive_weight * float(cfg.category_weights[cat])
         self.register_buffer("class_weight", w)
 
     def _freeze_bottom(self, n: int) -> None:

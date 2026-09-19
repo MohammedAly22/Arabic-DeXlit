@@ -31,6 +31,7 @@ from ..model.converter import (
 from ..model.detector import DetectorConfig, SpanDetector, script_of
 from ..model.lexicon import OOV_ID, Lexicon
 from ..schema import ID2TAG, OUTSIDE, spans_from_tags
+from ..training.dataset import build_context
 
 _WS = re.compile(r"\s+")
 
@@ -189,7 +190,10 @@ class DeXlitPipeline:
         if not spans:
             return Prediction(text, False, [], words, tags)
 
-        texts = [" ".join(words[s:e]) for s, e, _ in spans]
+        # Same context format the converter was trained on -- a bare span would
+        # be out of distribution and reintroduces the ambiguity context solves.
+        window = getattr(self.converter.cfg, "context_window", 0) if self.converter else 0
+        texts = [build_context(words, s, e, window) for s, e, _ in spans]
         cats = [c for _, _, c in spans]
         converted = self.convert_spans(texts, cats)
 
