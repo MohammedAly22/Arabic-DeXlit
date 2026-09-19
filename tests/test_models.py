@@ -1,0 +1,128 @@
+"""Shape and behaviour tests for both model stages.
+
+These use a tiny randomly-initialised encoder rather than downloading MARBERTv2,
+so the suite runs offline and in seconds while still exercising the real code
+paths: label projection, script features, the copy gate, and greedy decoding.
+"""
+import sys
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from arabic_dexlit.model.converter import (  # noqa: E402
+    BOS_ID,
+    ConverterConfig,
+    SpanConverter,
+    decode_ids,
+    encode_chars,
+)
+from arabic_dexlit.model.detector import (  # noqa: E402
+    DetectorConfig,
+    SpanDetector,
+    script_of,
+)
+from arabic_dexlit.schema import IGNORE_INDEX, NUM_TAGS  # noqa: E402
+
+
+def _tiny_detector() -> SpanDetector:
+    """A SpanDetector on a 2-layer random BERT -- no network access needed."""
+    from transformers import BertConfig, BertModel
+
+    enc = BertModel(
+        BertConfig(
+            vocab_size=200, hidden_size=64, num_hidden_layers=2,
+            num_attention_heads=2, intermediate_size=128, max_position_embeddings=64,
+        )
+    )
+    return SpanDetector(DetectorConfig(num_tags=NUM_TAGS, script_embed_dim=8), encoder=enc)
+
+
+def test_script_features_classify_correctly():
+    assert script_of("انترن") == 0   # Arabic
+    assert script_of("intern") == 1                             # Latin
+    assert script_of("2024") == 2                               # digits
+    assert script_of("...") == 4 or script_of("...") == 3       # punctuation
+    assert script_of("AI2") == 4                                # mixed
+
+
+def test_detector_forward_and_loss():
+    m = _tiny_detector()
+    ids = torch.randint(5, 199, (2, 12))
+    mask = torch.ones_like(ids)
+    scripts = torch.zeros_like(ids)
+    labels = torch.randint(0, NUM_TAGS, (2, 12))
+    labels[:, 0] = IGNORE_INDEX  # [CLS] carries no label
+    out = m(ids, mask, scripts, labels=labels, copy_labels=(labels == 0).long())
+    assert out["logits"].shape == (2, 12, NUM_TAGS)
+    assert out["loss"].requires_grad
+    out["loss"].backward()  # gradients must flow
+    assert any(p.grad is not None for p in m.parameters() if p.requires_grad)
+
+
+def test_copy_gate_can_veto_edits():
+    """With a threshold of 0, every token is forced to O -- the safe extreme."""
+    m = _tiny_detector().eval()
+    ids = torch.randint(5, 199, (1, 8))
+    mask = torch.ones_like(ids)
+    pred = m.predict(ids, mask, torch.zeros_like(ids), copy_threshold=0.0)
+    assert torch.all(pred == 0)
+
+
+def test_detector_runs_without_script_features():
+    cfg = DetectorConfig(num_tags=NUM_TAGS, use_script_features=False, use_copy_gate=False)
+    from transformers import BertConfig, BertModel
+
+    enc = BertModel(
+        BertConfig(vocab_size=200, hidden_size=64, num_hidden_layers=2,
+                   num_attention_heads=2, intermediate_size=128,
+                   max_position_embeddings=64)
+    )
+    m = SpanDetector(cfg, encoder=enc)
+    out = m(torch.randint(5, 199, (2, 10)), torch.ones(2, 10, dtype=torch.long))
+    assert out["logits"].shape == (2, 10, NUM_TAGS)
+    assert "copy_logits" not in out
+
+
+def test_converter_forward_and_decode():
+    cfg = ConverterConfig(d_model=64, nhead=2, num_encoder_layers=1,
+                          num_decoder_layers=1, dim_feedforward=128)
+    m = SpanConverter(cfg)
+    src = torch.randint(4, 50, (3, 10))
+    cat = torch.randint(0, cfg.num_categories, (3,))
+    tgt_in = torch.randint(4, 50, (3, 7))
+    tgt_out = torch.randint(4, 50, (3, 7))
+    out = m(src, cat, tgt_in, tgt_out)
+    assert out["logits"].shape == (3, 7, cfg.vocab_size)
+    out["loss"].backward()
+
+    gen = m.greedy_decode(src, cat, max_len=6)
+    assert gen.shape[0] == 3 and gen.shape[1] <= 6
+
+
+def test_char_roundtrip():
+    """Encoding then decoding must preserve the string."""
+    for text in ["intern", "AI", "ahmed@gmail.com", "Orange Innovation"]:
+        ids = encode_chars(text, 48)
+        assert decode_ids(ids) == text
+
+
+def test_converter_is_small():
+    """The whole point is a tiny stage 2 -- guard against config drift."""
+    m = SpanConverter(ConverterConfig())
+    assert m.num_parameters() < 12_000_000, m.num_parameters()
+
+
+if __name__ == "__main__":
+    failed = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {name}")
+            except Exception as e:
+                failed += 1
+                print(f"FAIL {name}: {type(e).__name__}: {e}")
+    print("\nall green" if not failed else f"\n{failed} failing")
+    sys.exit(1 if failed else 0)

@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Data and checkpoints are large and rebuildable; publish them to the Hub
+# rather than committing them to git.
+data/raw/
+data/interim/
+data/processed/
+outputs/
+wandb/
+*.pt
+*.jsonl
+
+.ipynb_checkpoints/
+.DS_Store
+
+# Exported corpus: published to the Hugging Face Hub, not committed here.
+# (train.parquet alone is ~62MB, over GitHub's comfortable file size.)
+data/hf/
+data/hubtest/
+*.parquet

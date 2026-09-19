@@ -1,0 +1,41 @@
+# ArabicDeXlit -- stage 1 tuned for a Colab T4 (16GB, no bf16, ~4x slower).
+#
+# Differences from the base recipe, and why:
+#  - smaller batch + grad accumulation keeps the effective batch at 32
+#  - the bottom 6 encoder layers are frozen: they already model Arabic well and
+#    freezing them is the single biggest T4 speedup
+#  - shorter max_length, since the corpus is mostly short utterances
+#  - the corpus is capped so a run finishes inside one Colab session
+
+data_dir: data/processed
+output_dir: outputs/detector
+max_length: 96
+max_train_examples: 200000
+max_eval_examples: 10000
+
+encoder_name: UBC-NLP/MARBERTv2
+dropout: 0.1
+use_script_features: true
+use_copy_gate: true
+copy_gate_weight: 0.3
+positive_weight: 2.0
+freeze_encoder_layers: 6
+
+epochs: 2
+batch_size: 16
+eval_batch_size: 32
+grad_accum: 2
+learning_rate: 5.0e-5      # higher lr compensates for the frozen lower stack
+weight_decay: 0.01
+warmup_ratio: 0.06
+max_grad_norm: 1.0
+seed: 42
+num_workers: 2
+
+log_every: 50
+eval_every: 1000
+eval_max_batches: 40
+false_edit_penalty: 0.5
+
+wandb_project: arabic-dexlit
+run_name: detector-t4

@@ -1,0 +1,19 @@
+# Core
+torch>=2.0.0
+transformers>=4.35.0
+numpy>=1.24.0
+
+# Config + plots
+pyyaml>=6.0
+matplotlib>=3.7.0
+
+# Experiment tracking (optional; training runs without it)
+wandb>=0.16.0
+
+# Correct Arabic shaping/RTL in the diagnostic figures (optional -- plots still
+# render without these, just with unshaped labels)
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+
+# Publishing to the Hub (optional)
+huggingface-hub>=0.19.0

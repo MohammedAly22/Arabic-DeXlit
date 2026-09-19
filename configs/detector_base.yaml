@@ -1,0 +1,50 @@
+# ArabicDeXlit -- stage 1 (span detector), default recipe.
+#
+# Tuned for a Colab A100 or L4. For a T4 see detector_t4.yaml.
+# Every value here can be overridden on the command line:
+#   python scripts/train.py --config configs/detector_base.yaml --epochs 2
+
+# --- data ---
+data_dir: data/processed
+output_dir: outputs/detector
+max_length: 128
+# Cap the corpus for a quicker run. null = use everything.
+max_train_examples: null
+max_eval_examples: 20000
+
+# --- model ---
+# MARBERTv2 is pretrained on dialectal Arabic (Twitter), which matches this task
+# far better than the MSA-heavy alternatives.
+encoder_name: UBC-NLP/MARBERTv2
+dropout: 0.1
+use_script_features: true     # feed Arabic/Latin/digit/punct as an embedding
+use_copy_gate: true           # calibrated "leave this token alone" head
+copy_gate_weight: 0.3
+# Spans are a minority of tokens; without this the model can score well by
+# predicting O everywhere.
+positive_weight: 2.0
+freeze_encoder_layers: 0      # raise to 4-6 to speed up a T4 run
+
+# --- optimisation ---
+epochs: 3
+batch_size: 32
+eval_batch_size: 64
+grad_accum: 1
+learning_rate: 3.0e-5
+weight_decay: 0.01
+warmup_ratio: 0.06
+max_grad_norm: 1.0
+seed: 42
+num_workers: 2
+
+# --- evaluation / checkpointing ---
+log_every: 50
+eval_every: 1000
+eval_max_batches: 60
+# Checkpoints are selected on span_f1 - penalty * false_edit_rate, so a model
+# that scores well while corrupting monolingual Arabic is never chosen.
+false_edit_penalty: 0.5
+
+# --- logging ---
+wandb_project: arabic-dexlit
+run_name: detector-marbertv2

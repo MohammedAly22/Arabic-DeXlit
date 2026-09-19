@@ -1,0 +1,198 @@
+"""End-to-end inference: detect spans, convert them, rebuild the sentence.
+
+The pass-through guarantee is enforced here, in code, not hoped for from the
+weights:
+
+* a sentence whose tokens are all tagged ``O`` short-circuits and the **original
+  string is returned unchanged**, before any conversion runs;
+* tokens outside a span are never passed through the converter, so they cannot
+  be altered;
+* rebuilding preserves the original whitespace of untouched regions.
+
+That means the worst a mis-firing detector can do is convert a span it should
+have left alone -- it can never corrupt text it did not flag.
+"""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+
+from ..model.converter import (
+    CATEGORY_IDS,
+    ConverterConfig,
+    SpanConverter,
+    decode_ids,
+    encode_chars,
+)
+from ..model.detector import DetectorConfig, SpanDetector, script_of
+from ..schema import ID2TAG, OUTSIDE, spans_from_tags
+
+_WS = re.compile(r"\s+")
+
+
+@dataclass
+class Prediction:
+    text: str
+    changed: bool
+    spans: list[dict]
+    tokens: list[str]
+    tags: list[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "text": self.text,
+            "changed": self.changed,
+            "spans": self.spans,
+        }
+
+
+class DeXlitPipeline:
+    """Load a trained ArabicDeXlit model and run it over text."""
+
+    def __init__(
+        self,
+        detector: SpanDetector,
+        converter: SpanConverter | None,
+        tokenizer,
+        *,
+        device: torch.device | str = "cpu",
+        copy_threshold: float | None = None,
+        max_length: int = 256,
+    ) -> None:
+        self.device = torch.device(device)
+        self.detector = detector.to(self.device).eval()
+        self.converter = converter.to(self.device).eval() if converter is not None else None
+        self.tok = tokenizer
+        self.copy_threshold = copy_threshold
+        self.max_length = max_length
+
+    # --- loading ----------------------------------------------------------
+    @classmethod
+    def from_pretrained(
+        cls,
+        path: str | Path,
+        *,
+        device: torch.device | str = "cpu",
+        copy_threshold: float | None = None,
+    ) -> "DeXlitPipeline":
+        from transformers import AutoTokenizer
+
+        path = Path(path)
+        dcfg = DetectorConfig.from_dict(
+            json.loads((path / "detector_config.json").read_text(encoding="utf-8"))
+        )
+        tok = AutoTokenizer.from_pretrained(str(path), use_fast=True)
+        det = SpanDetector(dcfg)
+        det.load_state_dict(torch.load(path / "detector.pt", map_location="cpu"))
+
+        conv = None
+        cpath = path / "converter.pt"
+        if cpath.exists():
+            ccfg = ConverterConfig.from_dict(
+                json.loads((path / "converter_config.json").read_text(encoding="utf-8"))
+            )
+            conv = SpanConverter(ccfg)
+            conv.load_state_dict(torch.load(cpath, map_location="cpu"))
+        return cls(det, conv, tok, device=device, copy_threshold=copy_threshold)
+
+    # --- detection --------------------------------------------------------
+    @torch.no_grad()
+    def tag(self, words: list[str]) -> list[str]:
+        """Return one tag per word."""
+        if not words:
+            return []
+        enc = self.tok(
+            words,
+            is_split_into_words=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        word_ids = enc.word_ids()
+        scripts = torch.tensor(
+            [[0 if w is None else script_of(words[w]) for w in word_ids]],
+            dtype=torch.long,
+        )
+        pred = self.detector.predict(
+            enc["input_ids"].to(self.device),
+            enc["attention_mask"].to(self.device),
+            scripts.to(self.device),
+            copy_threshold=self.copy_threshold,
+        )[0].cpu().tolist()
+
+        tags = [OUTSIDE] * len(words)
+        seen: set[int] = set()
+        for pos, w in enumerate(word_ids):
+            if w is None or w in seen:
+                continue
+            seen.add(w)
+            tags[w] = ID2TAG.get(int(pred[pos]), OUTSIDE)
+        return tags
+
+    # --- conversion -------------------------------------------------------
+    @torch.no_grad()
+    def convert_spans(self, texts: list[str], categories: list[str]) -> list[str]:
+        """Convert flagged spans to English. Batched for a single decode pass."""
+        if not texts or self.converter is None:
+            return list(texts)
+        cfg = self.converter.cfg
+        src = [encode_chars(t, cfg.max_src_len) for t in texts]
+        n = max(len(s) for s in src)
+        src_t = torch.tensor([s + [0] * (n - len(s)) for s in src], dtype=torch.long)
+        cat_t = torch.tensor(
+            [CATEGORY_IDS.get(c, 0) for c in categories], dtype=torch.long
+        )
+        gen = self.converter.greedy_decode(src_t.to(self.device), cat_t.to(self.device))
+        return [decode_ids(r) for r in gen.cpu().tolist()]
+
+    # --- end to end -------------------------------------------------------
+    def __call__(self, text: str) -> Prediction:
+        return self.predict(text)
+
+    def predict(self, text: str) -> Prediction:
+        words = text.split()
+        if not words:
+            return Prediction(text, False, [], [], [])
+
+        tags = self.tag(words)
+
+        # The guarantee: nothing flagged => the original string, untouched.
+        if all(t == OUTSIDE for t in tags):
+            return Prediction(text, False, [], words, tags)
+
+        spans = spans_from_tags(tags)
+        if not spans:
+            return Prediction(text, False, [], words, tags)
+
+        texts = [" ".join(words[s:e]) for s, e, _ in spans]
+        cats = [c for _, _, c in spans]
+        converted = self.convert_spans(texts, cats)
+
+        out: list[str] = []
+        cursor = 0
+        recorded: list[dict] = []
+        for (start, end, cat), new in zip(spans, converted):
+            out.extend(words[cursor:start])
+            new = new.strip() or " ".join(words[start:end])
+            out.append(new)
+            recorded.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "category": cat,
+                    "original": " ".join(words[start:end]),
+                    "converted": new,
+                }
+            )
+            cursor = end
+        out.extend(words[cursor:])
+
+        result = " ".join(out)
+        return Prediction(result, result != text, recorded, words, tags)
+
+    def predict_batch(self, texts: list[str]) -> list[Prediction]:
+        return [self.predict(t) for t in texts]
