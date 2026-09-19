@@ -1,15 +1,36 @@
-"""Stage 2: the character-level span converter.
+"""Stage 2: the span converter -- a hybrid word + character model.
 
-Runs **only** on spans the detector flagged, mapping Arabic characters to Latin
-ones: ``انترن`` -> ``intern``, ``ايه اي`` -> ``AI``.
+Runs **only** on spans the detector flagged, turning Arabic script back into
+English: ``انترن`` -> ``intern``, ``ايه اي`` -> ``AI``.
 
-Why character level
--------------------
-The mapping is phonetic, not lexical. A word-level model could only emit English
-words it saw in training; a character model generalises to unseen ones, which
-matters because the long tail here is company names, product names and jargon
-that no fixed vocabulary covers. The alphabet is tiny (~80 symbols), so the
-model stays small enough to add negligible latency.
+Two heads over one shared encoder
+---------------------------------
+Measured on this corpus, the task is *nearly closed-vocabulary*: 1,245,593
+training spans reduce to only 15,326 unique English targets, the top 1,000
+covering 93.3% of test spans and the full lexicon 99.4%. Only 0.6% is genuinely
+unseen, and that tail is mostly emails and URLs, which are compositional.
+
+Free character generation was therefore doing difficult, error-prone work in the
+99.4% of cases where a lookup is exact. The observed symptom was a decoder
+producing ``devers`` and ``deversion`` for ``فريندس`` (gold ``friends``):
+plausible English orthography, wrong word, because a from-scratch character
+decoder has no lexical prior.
+
+* **Word head** -- a softmax over the lexicon, read off mean-pooled encoder
+  memory. When confident it emits a *whole dictionary word*, so a misspelling is
+  impossible, and it runs no autoregressive loop at all.
+* **Character head** -- the decoder below, used wherever the word head abstains.
+  This is what keeps the vocabulary open for brand names, jargon and URLs.
+
+``OOV`` is a trained class rather than a masked one, so the head learns to
+*abstain* instead of forcing a wrong lexicon entry onto a word it has never seen.
+Set ``use_word_head=False`` to fall back to pure character decoding.
+
+Why character level for the fallback
+------------------------------------
+The mapping is phonetic, not lexical, so a character model generalises to words
+no vocabulary contains. The alphabet is tiny (~130 symbols), keeping the model
+small enough that latency stays negligible.
 
 Why a separate model from the detector
 --------------------------------------
@@ -20,10 +41,9 @@ monolingual Arabic sentence decodes nothing at all.
 
 The category token
 ------------------
-The decoder is conditioned on the detector's category, because the same input
-characters have different correct outputs depending on it: ``ايه اي`` is ``AI``
-as an ACRONYM but would be ``eh ay`` as plain CS. Passing the category makes the
-conversion policy explicit instead of something the model must guess.
+The model is conditioned on the detector's category, because the same characters
+convert differently depending on it: ``ايه اي`` is ``AI`` as an ACRONYM but would
+be ``eh ay`` as plain CS.
 """
 from __future__ import annotations
 
@@ -109,7 +129,14 @@ class ConverterConfig:
     lexicon_size: int = 0          # filled in when the lexicon is built
     word_loss_weight: float = 1.0
     # Below this probability the word head abstains and the characters decide.
+    # 0.90 is deliberately conservative: a wrong lexicon word is a worse failure
+    # than a slightly misspelled character decode, because it is confidently
+    # wrong. Lower it only if evaluation shows the head firing too rarely.
     word_confidence: float = 0.90
+    # Label smoothing on the word head. Over a vocabulary of ~15K, a hard
+    # one-hot target makes the head slow to become confident enough to fire at
+    # all; a little smoothing calibrates it without hurting accuracy.
+    word_label_smoothing: float = 0.05
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -253,7 +280,10 @@ class SpanConverter(nn.Module):
                 # OOV spans are kept in this loss (not ignored): the head must
                 # learn to *predict* OOV so it abstains rather than guessing a
                 # wrong lexicon word for a brand name it has never seen.
-                word_loss = F.cross_entropy(res["word_logits"], word_ids)
+                word_loss = F.cross_entropy(
+                    res["word_logits"], word_ids,
+                    label_smoothing=self.cfg.word_label_smoothing,
+                )
                 res["word_loss"] = word_loss.detach()
                 loss = loss + self.cfg.word_loss_weight * word_loss
             res["loss"] = loss

@@ -55,6 +55,7 @@ def evaluate(
     m = ConverterMetrics()
     losses: list[float] = []
     samples: list[tuple[str, str, str]] = []
+    word_fired = word_right = word_answerable = 0
 
     for i, batch in enumerate(loader):
         if max_batches and i >= max_batches:
@@ -77,9 +78,15 @@ def evaluate(
         if lexicon is not None and model.word_head is not None:
             widx, wconf = model.predict_words(batch["src"], batch["category"])
             thr = model.cfg.word_confidence
+            gold_w = batch.get("word_ids")
+            gold_w = gold_w.cpu().tolist() if gold_w is not None else None
             for j, (wi, wc) in enumerate(zip(widx.cpu().tolist(), wconf.cpu().tolist())):
+                answerable = gold_w is not None and gold_w[j] != OOV_ID
+                word_answerable += int(answerable)
                 if wi != OOV_ID and wc >= thr:
                     preds[j] = lexicon.word(wi)
+                    word_fired += 1
+                    word_right += int(answerable and wi == gold_w[j])
         golds = [decode_ids(r) for r in batch["tgt_out"].cpu().tolist()]
         cats = [_ID2CAT.get(int(c), "CS") for c in batch["category"].cpu().tolist()]
         m.update(preds, golds, cats)
@@ -90,6 +97,12 @@ def evaluate(
 
     res = m.compute()
     res["loss"] = float(np.mean(losses)) if losses else 0.0
+    if lexicon is not None:
+        # fire_rate: how often the head was confident enough to answer.
+        # word_precision: of those, how often it was right.
+        res["word_fire_rate"] = word_fired / max(1, m.total)
+        res["word_precision"] = word_right / max(1, word_fired)
+        res["word_answerable"] = word_answerable / max(1, m.total)
     model.train()
     return res, samples
 
@@ -253,11 +266,17 @@ def train_converter(cfg: dict) -> dict:
                     model, val_loader, device, amp=amp, amp_dtype=amp_dtype,
                     max_batches=cfg.get("eval_max_batches", 20), lexicon=lexicon,
                 )
-                print(
+                line = (
                     f"[eval ] step {step} exact {res['exact_match']:.4f} "
-                    f"char {res['char_accuracy']:.4f}",
-                    flush=True,
+                    f"char {res['char_accuracy']:.4f}"
                 )
+                if "word_fire_rate" in res:
+                    line += (
+                        f" | word head: fires {res['word_fire_rate']:.1%} "
+                        f"prec {res['word_precision']:.1%} "
+                        f"(answerable {res['word_answerable']:.1%})"
+                    )
+                print(line, flush=True)
                 for s, p, g in samples[:5]:
                     mark = "OK " if p.strip().lower() == g.strip().lower() else "BAD"
                     print(f"        {mark} {s!r} -> {p!r} (gold {g!r})")
