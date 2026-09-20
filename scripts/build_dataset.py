@@ -22,6 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from arabic_dexlit.data.build import build_corpus  # noqa: E402
+from arabic_dexlit.data.real_cs import harvest as harvest_real_cs  # noqa: E402
+from arabic_dexlit.data.real_cs import iter_real_cs  # noqa: E402
 from arabic_dexlit.data.vocab_inject import iter_vocab_sentences  # noqa: E402
 from arabic_dexlit.data.sources import (  # noqa: E402
     iter_monolingual,
@@ -57,6 +59,19 @@ def main() -> None:
              "corpus barely contains; 0 disables",
     )
     p.add_argument(
+        "--real-cs", default="data/raw/real_cs.jsonl",
+        help="human code-switched sentences (ArzEn); teaches the fused-article "
+             "pattern (الsystem) that synthetic data never produces",
+    )
+    p.add_argument(
+        "--fetch-real-cs", action="store_true",
+        help="harvest the real code-switching corpus before building",
+    )
+    p.add_argument(
+        "--real-cs-repeat", type=int, default=8,
+        help="oversample real sentences; they are few but worth many synthetic ones",
+    )
+    p.add_argument(
         "--mono-cache", default="data/raw/monolingual.txt",
         help="local cache of monolingual Arabic used for pass-through examples",
     )
@@ -73,6 +88,15 @@ def main() -> None:
         streams.append(iter_synthetic(args.synthetic))
     if args.vocab_sentences:
         streams.append(iter_vocab_sentences(args.vocab_sentences, seed=args.seed))
+    if args.fetch_real_cs:
+        harvest_real_cs(args.real_cs)
+    if Path(args.real_cs).exists() and args.real_cs_repeat:
+        # Deliberately oversampled. There are only a few hundred of these, but
+        # they carry orthographic habits (الsystem, fused articles) that the
+        # generator cannot produce, so each is worth many synthetic rows.
+        real = list(iter_real_cs(args.real_cs))
+        streams.append(iter(real * args.real_cs_repeat))
+        print(f"[real-cs] {len(real):,} sentences x{args.real_cs_repeat}")
     if not streams:
         p.error("no sources enabled")
 

@@ -1,0 +1,61 @@
+# ArabicDeXlit -- end-to-end sentence rewriter (ByT5).
+#
+# One model replaces the whole detector + router + converter pipeline. The noisy
+# sentence goes in, the corrected sentence comes out, and every decision is made
+# by cross-attention rather than by routing or lookup.
+#
+#   python scripts/train.py --stage seq2seq --config configs/seq2seq_base.yaml
+
+data_dir: data/processed
+output_dir: outputs/dexlit-s2s
+max_train_examples: null
+max_eval_examples: 4000
+
+# --- model ---
+# Byte-level: a 256-symbol vocabulary means NOTHING is ever out of vocabulary.
+# C++ is three bytes, الsystem needs no segmentation, and an unseen brand name
+# is representable exactly. Published comparisons put ByT5 well ahead of subword
+# mT5 on transliteration, which is what this task is.
+# Use google/byt5-small for a faster first run, byt5-large for maximum quality.
+model_name: google/byt5-base
+task_prefix: "restore code-switching: "
+
+# Arabic costs ~2 bytes/char in UTF-8. Measured on this corpus, p99 is 393
+# bytes, so 512 covers effectively every sentence.
+max_source_length: 512
+max_target_length: 512
+dropout_rate: 0.1
+label_smoothing: 0.1
+
+# Beam search earns its cost here: "Presentation" vs "Presantation" differs by
+# one byte deep in the sequence, where greedy decoding cannot recover.
+num_beams: 4
+length_penalty: 1.0
+no_repeat_ngram_size: 0     # byte-level -- n-gram blocking would corrupt words
+
+# --- optimisation ---
+# ByT5-base is ~580M parameters and byte sequences are long, so the batch is
+# small and gradient accumulation carries the effective batch to 64.
+epochs: 3
+batch_size: 8
+eval_batch_size: 8
+grad_accum: 8
+learning_rate: 1.0e-4
+weight_decay: 0.01
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+gradient_checkpointing: true   # long sequences; this is what makes it fit
+seed: 42
+num_workers: 4
+
+log_every: 50
+eval_every: 1000
+# Generation during eval is slow, so keep the sample small and frequent.
+eval_max_batches: 16
+
+# Checkpoints are chosen on sentence_exact - umr_penalty * UMR, so a model that
+# improves conversion while corrupting untouched Arabic cannot win.
+umr_penalty: 1.0
+
+wandb_project: arabic-dexlit
+run_name: byt5-base-seq2seq

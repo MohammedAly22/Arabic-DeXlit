@@ -1,18 +1,24 @@
 #!/usr/bin/env python
-"""Evaluate a trained ArabicDeXlit model on a held-out split.
+"""Evaluate the end-to-end rewriter on a held-out split.
 
-Reports the end-to-end numbers that decide whether the model is usable:
+Read the report in this order:
 
-* **passthrough_accuracy** -- of the sentences that must come back untouched,
-  how many did. The safety metric; read it first.
-* **sentence_exact_match** -- the whole output string is correct.
-* per-category span F1 and converter exact-match, to show *which* kind of span
-  (acronym, email, entity...) is weak.
+1. **unnecessary_modification_rate** -- of the tokens that should have been left
+   alone, how many were changed. For a drop-in ASR post-processor this decides
+   whether the model is deployable at all: a missed conversion is recoverable by
+   a reader, a corrupted word is not.
+2. **passthrough_accuracy** -- pure-Arabic sentences returned byte-identical.
+3. **sentence_exact_match** -- the whole output string correct.
+
+Sentence exact-match alone is misleading here, because a large share of spans
+are trivial (already-Latin text that only needs copying). A model can score well
+on it while quietly damaging ordinary Arabic, which is exactly what the first
+two metrics catch.
 
 Example
 -------
-    python scripts/evaluate.py --model-dir outputs/dexlit \
-        --data data/processed/test.jsonl --out outputs/dexlit/test_report.json
+    python scripts/evaluate.py --model-dir outputs/dexlit-s2s \
+        --data data/processed/test.jsonl --out outputs/dexlit-s2s/test_report.json
 """
 from __future__ import annotations
 
@@ -27,24 +33,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import torch  # noqa: E402
 
-from arabic_dexlit.inference.pipeline import DeXlitPipeline  # noqa: E402
+from arabic_dexlit.model.seq2seq import Seq2SeqConfig, generate  # noqa: E402
 from arabic_dexlit.schema import OUTSIDE  # noqa: E402
-from arabic_dexlit.training.metrics import DetectorMetrics  # noqa: E402
-from arabic_dexlit.schema import TAG2ID  # noqa: E402
+from arabic_dexlit.training.metrics import EndToEndMetrics  # noqa: E402
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model-dir", required=True)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--model-dir", required=True, help="directory holding seq2seq/")
     p.add_argument("--data", default="data/processed/test.jsonl")
     p.add_argument("--out", default=None, help="write the JSON report here")
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--num-beams", type=int, default=4)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument(
-        "--copy-threshold", type=float, default=None,
-        help="force tokens the copy gate is confident about back to O",
-    )
-    p.add_argument("--show", type=int, default=10, help="print this many examples")
+    p.add_argument("--show", type=int, default=10, help="print this many errors")
     args = p.parse_args()
 
     rows = []
@@ -56,66 +61,71 @@ def main() -> None:
                 break
     print(f"[eval] {len(rows):,} examples from {args.data}")
 
-    pipe = DeXlitPipeline.from_pretrained(
-        args.model_dir, device=args.device, copy_threshold=args.copy_threshold
-    )
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    det = DetectorMetrics()
-    sent_exact = 0
-    pass_total = pass_ok = 0
-    edit_total = edit_ok = 0
-    by_cat_total: Counter = Counter()
-    by_cat_ok: Counter = Counter()
+    model_path = Path(args.model_dir) / "seq2seq"
+    if not model_path.exists():
+        model_path = Path(args.model_dir)
+    cfg_path = Path(args.model_dir) / "seq2seq_config.json"
+    cfg = (
+        Seq2SeqConfig.from_dict(json.loads(cfg_path.read_text(encoding="utf-8")))
+        if cfg_path.exists()
+        else Seq2SeqConfig()
+    )
+    cfg.num_beams = args.num_beams
+
+    tok = AutoTokenizer.from_pretrained(str(model_path))
+    model = AutoModelForSeq2SeqLM.from_pretrained(str(model_path)).to(args.device).eval()
+
+    metrics = EndToEndMetrics()
     by_dialect_total: Counter = Counter()
     by_dialect_ok: Counter = Counter()
+    by_cat_total: Counter = Counter()
+    by_cat_ok: Counter = Counter()
+    pass_total = pass_ok = 0
     shown: list[dict] = []
 
     t0 = time.time()
-    for row in rows:
-        gold_text = row["tgt"]
-        out = pipe.predict(row["src"])
+    for i in range(0, len(rows), args.batch_size):
+        chunk = rows[i : i + args.batch_size]
+        preds = generate(model, tok, [r["src"] for r in chunk], cfg, device=args.device)
 
-        exact = out.text.strip() == gold_text.strip()
-        sent_exact += exact
+        for r, pred in zip(chunk, preds):
+            exact = pred.strip() == r["tgt"].strip()
+            metrics.update(
+                pred_tokens=pred.split(),
+                gold_tokens=r["tgt"].split(),
+                src_tokens=r["src_tokens"],
+                gold_tags=r["tags"],
+            )
 
-        is_pass = all(t == OUTSIDE for t in row["tags"])
-        if is_pass:
-            pass_total += 1
-            # For a pass-through row the bar is byte-identity, not "close".
-            pass_ok += int(out.text == row["src"])
-        else:
-            edit_total += 1
-            edit_ok += exact
+            # A pass-through row must come back byte-identical, not merely close.
+            if all(t == OUTSIDE for t in r["tags"]):
+                pass_total += 1
+                pass_ok += int(pred.strip() == r["src"].strip())
 
-        dialect = row.get("dialect", "unk")
-        by_dialect_total[dialect] += 1
-        by_dialect_ok[dialect] += exact
-        for s in row.get("spans", []):
-            by_cat_total[s["category"]] += 1
-        if exact:
-            for s in row.get("spans", []):
-                by_cat_ok[s["category"]] += 1
+            d = r.get("dialect", "unk")
+            by_dialect_total[d] += 1
+            by_dialect_ok[d] += exact
+            for s in r.get("spans", []):
+                by_cat_total[s["category"]] += 1
+                by_cat_ok[s["category"]] += exact
 
-        gold_ids = [TAG2ID.get(t, 0) for t in row["tags"]]
-        pred_ids = [TAG2ID.get(t, 0) for t in out.tags[: len(gold_ids)]]
-        pred_ids += [0] * (len(gold_ids) - len(pred_ids))
-        det.update([pred_ids], [gold_ids])
+            if len(shown) < args.show and not exact:
+                shown.append({"src": r["src"], "pred": pred, "gold": r["tgt"]})
 
-        if len(shown) < args.show and not exact and not is_pass:
-            shown.append({"src": row["src"], "pred": out.text, "gold": gold_text})
+        if i and i % (args.batch_size * 20) == 0:
+            print(f"[eval]   {i:,}/{len(rows):,}", flush=True)
 
     elapsed = time.time() - t0
     report = {
         "n_examples": len(rows),
-        "sentence_exact_match": sent_exact / max(1, len(rows)),
-        # ``None`` rather than 0.0 when the slice contains no pass-through rows:
-        # reporting a hard 0.0 for "not measured" reads as a total failure of the
-        # very guarantee this metric exists to check.
+        **metrics.compute(),
+        # ``None`` rather than 0.0 when the slice holds no pass-through rows:
+        # reporting 0.0 for "not measured" reads as total failure of the very
+        # guarantee this metric exists to check.
         "passthrough_accuracy": (pass_ok / pass_total) if pass_total else None,
         "passthrough_examples": pass_total,
-        "edit_exact_match": (edit_ok / edit_total) if edit_total else None,
-        "edit_examples": edit_total,
-        "detector": det.compute(),
         "by_category_sentence_accuracy": {
             c: by_cat_ok[c] / n for c, n in by_cat_total.items() if n
         },

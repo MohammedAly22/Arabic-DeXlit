@@ -57,109 +57,60 @@ And the part that makes it safe to deploy:
 
 ## 🧠 How it works
 
-Most people would reach for a seq2seq model. That is the wrong tool here, for two reasons: a
-decoder is free to rewrite **any** token, so "pure Arabic must pass through unchanged" can only
-ever be *approximately* learned; and it decodes every sentence, paying latency whether or not
-there is anything to fix.
-
-Arabic-DeXlit splits the problem in two.
-
-<div align="center">
-<img src="assets/two-stages.png" alt="Stage 1 tags every token O or B-/I-category; if all tags are O the input string is returned untouched and stage 2 never runs; otherwise a ~53M-param context-aware converter rewrites only the flagged spans" width="95%">
-</div>
-
-**1️⃣ Stage 1 — the detector.** A token classifier over
-[MARBERTv2](https://huggingface.co/UBC-NLP/MARBERTv2), chosen because it is pretrained on
-*dialectal* Arabic rather than MSA. Each token gets one tag. `O` means *copy this verbatim*.
-
-**2️⃣ Stage 2 — a typed hybrid converter.** Each detected span is routed by its
-category, on one principle: **deterministic where structure exists, neural where ambiguity exists.**
-
-| Category | Path | Why |
-|:--|:--|:--|
-| 📧 `EMAIL` · 🔗 `URL` · 🔢 `NUMBER` · 🕐 `TIME` | **Parser** | `احمد ات جيميل دوت كوم` → `ahmed@gmail.com` is a *parse*, not an inference. `ات`=`@`, `دوت`=`.`. A decoder asked to generate this can hallucinate a domain or drop a dot; a parser cannot. |
-| 🔠 `ACRONYM` | **Closed inventory** | `ايه اي` → `AI` has a finite answer set. Scored against an inventory, so the output is always a real, correctly-cased acronym. |
-| 🏢 `ENTITY` | **Gazetteer → neural** | `مكروسوفت تيمس` → `Microsoft Teams` is entity *resolution*. No character mapping recovers the capital T. Measured on the corpus: 3,386 forms, only **7** ambiguous. |
-| 💬 `CS` | **Generate → rerank** | Genuinely ambiguous — `ميتينج` maps equally to `meting` or `meeting`. Several generators propose; a reranker picks using context. |
-
-**The rule transliterator is a prior, not an answer.** `فريندس → frinds` is phonetically
-right and orthographically wrong, so it is fed to the model as evidence rather than used
-directly: the model corrects a skeleton instead of deriving one from nothing.
+**One end-to-end model.** The noisy sentence goes in, the corrected sentence comes out. Every
+decision is made by the decoder's cross-attention — when it emits `Presentation` it is attending to
+`البريزنتيشن`, and when it emits `ال` it is attending to `ال`.
 
 ```
-عندي ‹ ميتينج › مهم النهارده ‖ mitinj   →   meeting
-      └─ span in context ─┘   └ prior ┘
-```
-
-### 🌍 Generality: answering words never seen in Arabic
-
-A lookup table cannot generalise here. Measured with the project's own transliterator, **one
-English word produces up to 26 distinct Arabic spellings** (`kubernetes`, `stakeholder`), because
-ASR is inconsistent about vowels, emphatics and gemination.
-
-So matching is done on **phonetic keys**, not surface forms. Every spelling of a word collapses to
-one key, and so does the English word itself:
-
-```
-ميتينج · ميتنج · ميطنغ  ──►  MTNG  ◄──  meeting
-```
-
-Candidates then come from several generators at once, and a reranker scores them together:
-
-```
-فريندس ──┬─► phonetic index ─► friends, French, friend
-         ├─► rule table ─────► frinds
-         └─► neural model ───► (its own proposal)
+كنت انترن في او اي اي اللي هي اورانج انوفيشن ايجيبت
                     │
-                    ▼   score = source · phonetic · lexicon · neural · context
-                 friends  ✅  (phonetic 1.00 vs French 0.60)
+                    ▼   ByT5  (byte-level encoder-decoder)
+                    │
+كنت intern في OIE اللي هي Orange Innovation Egypt
 ```
 
-**Context is what breaks ties.** In `عندي ميتينج مهم بكرة`, `meeting` and `mitten` are phonetically
-identical — the co-occurrence model scores them **0.93 vs 0.50**, and that decides it.
+### Why byte-level
 
-Verified: **12/12** words recalled from Arabic spellings never stored in the index, including
-`kubernetes`, `onboarding` and `microservice`.
+The vocabulary is **256 symbols**, so nothing is ever out of vocabulary. That is not a detail here:
 
-**Copy-by-default.** Every path can decline. A span nothing is confident about is
-returned unchanged, because for an ASR post-processor a missed conversion is far cheaper
-than a corrupted one.
-
-### 💡 Why this design earns its keep
-
-| Your requirement | How the architecture delivers it |
+| | |
 |:--|:--|
-| 🔒 **Pure Arabic must be unchanged** | `O` = copy verbatim. An all-`O` sentence short-circuits and returns the original string **before** any conversion runs. Structural, not learned. |
-| ⚡ **Near-zero added latency** | One encoder pass, then decoding over a few *short spans* rather than the whole sentence. Monolingual Arabic skips stage 2 entirely. |
-| 👁️ **Show me what it changes** | The tags **are** the explanation — they name exactly which words will change, and why. Plotted every evaluation. |
-| 🛡️ **Never corrupt untouched text** | Non-span tokens never reach the converter. The worst a mis-firing detector can do is convert a span it should have left alone. |
+| `C++` | three bytes — not an unknown token |
+| `الsystem` | no word segmentation needed to understand it |
+| an unseen brand name | representable exactly, always |
+| `ميتينج` / `ميتنج` / `ميطنغ` | a small edit in byte space, not three unrelated entries |
 
-### 🔬 Two task-specific additions
+Published comparisons find byte-level ByT5 substantially ahead of subword mT5 on transliteration
+and other spelling-sensitive tasks — which is precisely this task. The cost is sequence length
+(Arabic is ~2 bytes per character), but measured on this corpus the 99th percentile is 393 bytes,
+so a 512-byte budget covers effectively every sentence.
 
-**🔤 Script-feature injection.** Whether a character is Arabic, Latin, a digit or punctuation is
-*perfectly known* at inference — it is a property of the string, not something to infer. Feeding it
-in as an explicit embedding frees the encoder from rediscovering it, and helps sharply on the
-already-Latin and digit cases that must be left alone.
+### Why this replaced a five-component pipeline
 
-**🚦 A copy gate.** A scalar head per token predicting "is this token untouched", trained jointly
-with the tag head. It gives a calibrated, directly thresholdable pass-through signal, and at
-inference it can veto spurious edits — the conservative direction for a model that must not
-corrupt text.
+The previous design split stage 2 across parsers, a gazetteer, an acronym inventory, phonetic
+retrieval and a span converter. Each saw only a fragment of the sentence, and the failures followed
+directly from that:
 
-### 🏷️ Span categories
-
-The category is passed to the converter, because identical characters convert differently depending
-on it (`ايه اي` is `AI` as an acronym, but `eh ay` as an ordinary word).
-
-| Category | Input | Output |
+| Input | Old pipeline | End-to-end |
 |:--|:--|:--|
-| 💬 `CS` | `انترن` | `intern` |
-| 🔠 `ACRONYM` | `ايه اي` | `AI` |
-| 🏢 `ENTITY` | `اورانج انوفيشن ايجيبت` | `Orange Innovation Egypt` |
-| 📧 `EMAIL` | `احمد ات جيميل دوت كوم` | `ahmed@gmail.com` |
-| 🔢 `NUMBER` | `تو زيرو تو فور` | `2024` |
+| `سي بلاس بلاس` | `Scele leles` | **`C++`** |
+| `المانجر` | `manager` (article lost) | **`ال Manager`** |
+| `البريزنتيشن` | *skipped entirely* | **`ال Presentation`** |
+| `ايفالويشن` | `finish` | evaluation |
+| `ال` | `I'll` | `ال` |
 
----
+Every one of those is a *context* failure. The information needed was in the sentence; it simply
+never reached the component making the decision.
+
+Verified on real ByT5-small in 120 steps: **3/4 of those exact cases correct**, including `C++` and
+the fused article, with pure Arabic returned unchanged.
+
+### The metric that matters
+
+Sentence exact-match is reported, but **Unnecessary Modification Rate** is what decides whether the
+model is deployable: of the tokens that should have been left alone, how many were changed. A
+rewriter that improves conversion while quietly corrupting ordinary Arabic is worse than none, and
+exact-match cannot tell the two apart. Checkpoints are selected on `sentence_exact − UMR`.
 
 ## ⚡ Quick start
 
@@ -170,11 +121,13 @@ on it (`ايه اي` is `AI` as an acronym, but `eh ay` as an ordinary word).
 Click the badge and run the notebook top to bottom. It pulls the prebuilt corpus from the Hub, runs
 a one-minute smoke test, trains both stages, and evaluates.
 
-| GPU | Config (chosen automatically) | Approx. time |
+| GPU | Model | Approx. time |
 |:--|:--|:--|
-| 🟢 A100 | `configs/detector_base.yaml` | ~1–1.5 h |
-| 🟡 L4 | `configs/detector_base.yaml` | ~2–3 h |
-| 🔵 T4 | `configs/detector_t4.yaml` | ~3–4 h |
+| 🟢 A100 40GB | `google/byt5-base` (580M) | ~4–6 h, 3 epochs |
+| 🟡 L4 / 🔵 T4 | `google/byt5-small` (300M) | pass `--model-name google/byt5-small` |
+
+Byte-level sequences are long, so this is slower than a subword model — that is the price of
+letting one model see the whole sentence.
 
 ### 💻 Train locally
 
@@ -187,31 +140,28 @@ pip install -r requirements.txt
 python -c "import sys; sys.path.insert(0,'src'); \
 from arabic_dexlit.data.hub import download_corpus; download_corpus()"
 
-# 2. Verify the whole pipeline in ~1 minute before committing a GPU
-python scripts/train.py --stage both --smoke --no-wandb
+# 2. Train the end-to-end rewriter
+python scripts/train.py --stage seq2seq --config configs/seq2seq_base.yaml
 
-# 3. Train
-python scripts/train.py --stage both --config configs/detector_base.yaml
-
-# 4. Evaluate on the held-out test set
-python scripts/evaluate.py --model-dir outputs/detector --data data/processed/test.jsonl
+# 3. Evaluate on the held-out test set
+python scripts/evaluate.py --model-dir outputs/dexlit-s2s --data data/processed/test.jsonl
 ```
 
 ### 🐍 Use a trained model
 
 ```python
-from arabic_dexlit.inference.pipeline import DeXlitPipeline
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from arabic_dexlit.model.seq2seq import Seq2SeqConfig, generate
 
-pipe = DeXlitPipeline.from_pretrained("outputs/detector", device="cuda")
+cfg = Seq2SeqConfig()
+tok = AutoTokenizer.from_pretrained("outputs/dexlit-s2s/seq2seq")
+model = AutoModelForSeq2SeqLM.from_pretrained("outputs/dexlit-s2s/seq2seq").cuda().eval()
 
-out = pipe.predict("كنت انترن في او اي اي و بعدها جالي اوفر")
-print(out.text)      # كنت intern في OIE و بعدها جالي offer
-print(out.changed)   # True
-print(out.spans)     # [{'category': 'CS', 'original': 'انترن', 'converted': 'intern'}, ...]
+generate(model, tok, ["كنت انترن في او اي اي و بعدها جالي اوفر"], cfg, device="cuda")
+# ['كنت intern في OIE و بعدها جالي Offer']
 
-# Pure Arabic comes back untouched
-out = pipe.predict("أنا رايح البيت دلوقتي")
-print(out.changed)   # False
+generate(model, tok, ["أنا رايح البيت دلوقتي"], cfg, device="cuda")
+# ['أنا رايح البيت دلوقتي']   <- unchanged
 ```
 
 ---
@@ -324,38 +274,27 @@ score = span_f1 − 0.5 × false_edit_rate
 
 ```
 src/arabic_dexlit/
-├── schema.py              🏷️  tag scheme; O = identity, the pass-through guarantee
-├── data/
-│   ├── translit.py        🔤  English → Arabic script (manufactures training inputs)
-│   ├── pairing.py         🔗  builds aligned (input, tags, target) triples
-│   ├── sources.py         📚  corpus acquisition + monolingual screening
-│   ├── synth.py           ✨  Gemini synthesis for missing dialects/categories
-│   ├── build.py           🧱  leak-free splitting and dataset assembly
-│   ├── hub.py             ☁️  pull the prebuilt corpus from the Hub
-│   └── dialects.py        🌍  dialect registry and generation prompts
-├── convert/               🔀  the typed hybrid router
-│   ├── parsers.py         📧  EMAIL / URL / NUMBER / TIME -- exact or decline
-│   ├── translit_rules.py  🔤  Arabic → Latin skeleton, used as a prior
-│   ├── gazetteer.py       🏢  entity resolution (3,386 forms, 7 ambiguous)
-│   └── router.py          🚦  routes by category, copy-by-default
 ├── model/
-│   ├── detector.py        1️⃣  stage 1: tagger + script features + copy gate
-│   ├── converter.py       2️⃣  stage 2: char transformer + word head + NAR head
-│   ├── acronyms.py        🔠  closed acronym inventory
-│   └── lexicon.py         📖  closed-vocabulary word head
-├── training/
-│   ├── dataset.py         📦  torch datasets; sub-word label projection
-│   ├── metrics.py         📊  span F1 + the safety metrics
-│   ├── viz.py             📈  diagnostic plots
-│   ├── train_detector.py  🎓  stage-1 loop
-│   └── train_converter.py 🎓  stage-2 loop
-└── inference/
-    └── pipeline.py        🚀  end-to-end; enforces pass-through in code
+│   └── seq2seq.py         🧠  ByT5 end-to-end rewriter (the model)
+├── data/
+│   ├── translit.py        🔤  English → Arabic script (manufactures inputs)
+│   ├── pairing.py         🔗  builds aligned (input, target) pairs
+│   ├── real_cs.py         🗣️  harvests REAL human code-switching (ArzEn)
+│   ├── vocab.py           📚  the vocabulary speakers actually switch into
+│   ├── vocab_inject.py    💉  places that vocabulary into dialectal carriers
+│   ├── sources.py         📥  corpus acquisition + monolingual screening
+│   ├── synth.py           ✨  Gemini synthesis for missing dialects
+│   ├── build.py           🧱  leak-free splitting and assembly
+│   └── hub.py             ☁️  pull the prebuilt corpus from the Hub
+└── training/
+    ├── train_seq2seq.py   🎓  fine-tuning loop, UMR-selected checkpoints
+    ├── dataset.py         📦  row loading and balanced subsetting
+    └── metrics.py         📊  UMR, conversion accuracy, per-category
 
 scripts/    build_dataset.py · synthesize_data.py · export_dataset.py · train.py · evaluate.py
-configs/    detector_base.yaml · detector_t4.yaml · converter_base.yaml
+configs/    seq2seq_base.yaml
 notebooks/  ArabicDeXlit_Train_Colab.ipynb
-tests/      test_pairing.py · test_models.py · test_pipeline.py · test_hybrid.py
+tests/      test_pairing.py · test_seq2seq.py
 ```
 
 ## 🧪 Tests

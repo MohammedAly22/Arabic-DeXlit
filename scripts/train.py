@@ -69,6 +69,9 @@ _OVERRIDES: dict[str, type] = {
     "num_workers": int,
     "wandb_project": str,
     "run_name": str,
+    "model_name": str,
+    "num_beams": int,
+    "umr_penalty": float,
 }
 
 _SMOKE = {
@@ -87,7 +90,11 @@ _SMOKE = {
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
-        "--stage", choices=["detector", "converter", "both"], default="detector"
+        "--stage",
+        choices=["seq2seq", "detector", "converter", "both"],
+        default="seq2seq",
+        help="'seq2seq' is the end-to-end rewriter (recommended); "
+             "'detector'/'converter'/'both' train the older two-stage pipeline",
     )
     p.add_argument("--config", default="configs/detector_base.yaml")
     p.add_argument("--converter-config", default="configs/converter_base.yaml")
@@ -113,6 +120,15 @@ def main() -> None:
         return cfg
 
     results: dict = {}
+
+    if args.stage == "seq2seq":
+        from arabic_dexlit.training.train_seq2seq import train_seq2seq
+
+        cfg = resolve(args.config if args.config != "configs/detector_base.yaml"
+                      else "configs/seq2seq_base.yaml")
+        print("=== end-to-end sentence rewriter ===")
+        print(json.dumps({k: v for k, v in cfg.items() if v is not None}, indent=2))
+        results["seq2seq"] = train_seq2seq(cfg)
 
     if args.stage in ("detector", "both"):
         from arabic_dexlit.training.train_detector import train_detector
