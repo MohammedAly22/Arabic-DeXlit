@@ -28,7 +28,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
+import re
+
 from .parsers import DETERMINISTIC_PARSERS, parse_span
+from .phonetic import PhoneticIndex
+from .rerank import CandidateReranker
 from .translit_rules import transliterate_span
 
 
@@ -58,6 +62,9 @@ class SpanResult:
 # change) is far greater than the cost of a missed one.
 DEFAULT_THRESHOLD = 0.60
 
+_LATIN = re.compile(r"[A-Za-z]")
+_ARABIC = re.compile(r"[؀-ۿ]")
+
 # Parsers are exact when they succeed, so they carry full confidence.
 PARSER_SCORE = 1.0
 ACRONYM_SCORE = 0.95
@@ -76,6 +83,8 @@ class ConversionRouter:
         lexicon=None,
         threshold: float = DEFAULT_THRESHOLD,
         use_rule_fallback: bool = False,
+        phonetic_index: "PhoneticIndex | None" = None,
+        reranker: "CandidateReranker | None" = None,
     ) -> None:
         self.neural_fn = neural_fn
         self.acronyms = acronyms
@@ -85,6 +94,13 @@ class ConversionRouter:
         # Off by default: a phonetic skeleton ("mitinj") is usually worse than
         # leaving the original alone, so it is only used when explicitly asked.
         self.use_rule_fallback = use_rule_fallback
+        # Generate-and-rerank. The phonetic index proposes words that *sound*
+        # like the span -- which is how an unseen spelling is answered at all --
+        # and the reranker weighs those against the rule and neural proposals
+        # using context. Without these the router can only answer forms it has
+        # literally seen before.
+        self.phonetic_index = phonetic_index
+        self.reranker = reranker
 
     # --- per-category candidate generation --------------------------------
     def _parser_candidate(self, tokens: list[str], category: str) -> Candidate | None:
@@ -159,7 +175,20 @@ class ConversionRouter:
                     results[i] = SpanResult(gaz.text, "gazetteer", gaz.score, [gaz])
                     continue
 
-            # Nothing deterministic applied: the neural converter decides.
+            # Nothing deterministic applied. A span already in Latin script is
+            # then its own answer: 34.7% of spans arrive this way, and sending
+            # them to phonetic retrieval was the largest source of wrong edits,
+            # since the index cheerfully proposes a different word that merely
+            # sounds similar.
+            joined = " ".join(tokens)
+            if _LATIN.search(joined) and not _ARABIC.search(joined):
+                results[i] = SpanResult(
+                    joined, "copy", 1.0, [Candidate(joined, "copy", 1.0)],
+                    converted=False,
+                )
+                continue
+
+            # Genuinely ambiguous: generate candidates and rerank them.
             neural_queue.append(i)
 
         if neural_queue and self.neural_fn is not None:
@@ -167,30 +196,56 @@ class ConversionRouter:
             cats = [spans[i][1] for i in neural_queue]
             ctxs = [spans[i][2] for i in neural_queue]
             for i, (text, score) in zip(neural_queue, self.neural_fn(batch, cats, ctxs)):
-                results[i] = self._decide(spans[i][0], text, score)
+                results[i] = self._decide(spans[i][0], text, score, spans[i][2])
         else:
             for i in neural_queue:
-                results[i] = self._decide(spans[i][0], None, 0.0)
+                results[i] = self._decide(spans[i][0], None, 0.0, spans[i][2])
 
         return [r for r in results if r is not None]
 
     def _decide(
-        self, tokens: list[str], neural_text: str | None, score: float
+        self,
+        tokens: list[str],
+        neural_text: str | None,
+        score: float,
+        context: list[str] | None = None,
     ) -> SpanResult:
-        """Accept the neural answer only if it clears the bar; else keep the input."""
+        """Gather every proposal, rank them, and accept only a confident winner."""
         original = " ".join(tokens)
-        cands: list[Candidate] = []
-        if neural_text:
-            cands.append(Candidate(neural_text, "neural", score))
-        if self.use_rule_fallback:
-            rule = transliterate_span(tokens)
-            if rule:
-                cands.append(Candidate(rule, "rule", 0.30))
+        span_text = original
 
+        proposals: list[tuple[str, str, float]] = []
+        if neural_text:
+            proposals.append((neural_text, "neural", score))
+
+        # Phonetic retrieval: the generality path. Proposes English words whose
+        # sound matches the span, so a spelling never seen in training can still
+        # be answered.
+        if self.phonetic_index is not None:
+            for cand in self.phonetic_index.lookup(span_text, limit=8):
+                proposals.append((cand, "phonetic", 0.0))
+
+        rule = transliterate_span(tokens)
+        if rule and (self.use_rule_fallback or self.reranker is not None):
+            proposals.append((rule, "rule", 0.0))
+
+        if not proposals:
+            return SpanResult(original, "copy", 1.0 - score, [], converted=False)
+
+        if self.reranker is not None:
+            ranked = self.reranker.rank(span_text, proposals, context or [])
+            cands = [Candidate(c.text, c.source, c.total) for c in ranked]
+            top = ranked[0]
+            if top.total >= self.threshold:
+                return SpanResult(top.text, top.source, top.total, cands)
+            # Nothing cleared the bar: leave the span alone. A missed conversion
+            # is recoverable by a reader; a confident wrong edit is not.
+            cands.append(Candidate(original, "copy", 1.0 - top.total))
+            return SpanResult(original, "copy", 1.0 - top.total, cands, converted=False)
+
+        # No reranker configured: fall back to trusting the neural score alone.
+        cands = [Candidate(t, srcname, c) for t, srcname, c in proposals]
         if neural_text and score >= self.threshold:
             return SpanResult(neural_text, "neural", score, cands)
-
-        # Copy-by-default. A missed conversion is recoverable by a human reader;
-        # a confident wrong edit is not.
         cands.append(Candidate(original, "copy", 1.0 - score))
         return SpanResult(original, "copy", 1.0 - score, cands, converted=False)

@@ -80,7 +80,7 @@ category, on one principle: **deterministic where structure exists, neural where
 | 📧 `EMAIL` · 🔗 `URL` · 🔢 `NUMBER` · 🕐 `TIME` | **Parser** | `احمد ات جيميل دوت كوم` → `ahmed@gmail.com` is a *parse*, not an inference. `ات`=`@`, `دوت`=`.`. A decoder asked to generate this can hallucinate a domain or drop a dot; a parser cannot. |
 | 🔠 `ACRONYM` | **Closed inventory** | `ايه اي` → `AI` has a finite answer set. Scored against an inventory, so the output is always a real, correctly-cased acronym. |
 | 🏢 `ENTITY` | **Gazetteer → neural** | `مكروسوفت تيمس` → `Microsoft Teams` is entity *resolution*. No character mapping recovers the capital T. Measured on the corpus: 3,386 forms, only **7** ambiguous. |
-| 💬 `CS` | **Neural + rule prior + context** | Genuinely ambiguous — `ميتينج` maps equally to `meting` or `meeting`. The model sees the span in its sentence *plus* the rule-based skeleton. |
+| 💬 `CS` | **Generate → rerank** | Genuinely ambiguous — `ميتينج` maps equally to `meting` or `meeting`. Several generators propose; a reranker picks using context. |
 
 **The rule transliterator is a prior, not an answer.** `فريندس → frinds` is phonetically
 right and orthographically wrong, so it is fed to the model as evidence rather than used
@@ -90,6 +90,36 @@ directly: the model corrects a skeleton instead of deriving one from nothing.
 عندي ‹ ميتينج › مهم النهارده ‖ mitinj   →   meeting
       └─ span in context ─┘   └ prior ┘
 ```
+
+### 🌍 Generality: answering words never seen in Arabic
+
+A lookup table cannot generalise here. Measured with the project's own transliterator, **one
+English word produces up to 26 distinct Arabic spellings** (`kubernetes`, `stakeholder`), because
+ASR is inconsistent about vowels, emphatics and gemination.
+
+So matching is done on **phonetic keys**, not surface forms. Every spelling of a word collapses to
+one key, and so does the English word itself:
+
+```
+ميتينج · ميتنج · ميطنغ  ──►  MTNG  ◄──  meeting
+```
+
+Candidates then come from several generators at once, and a reranker scores them together:
+
+```
+فريندس ──┬─► phonetic index ─► friends, French, friend
+         ├─► rule table ─────► frinds
+         └─► neural model ───► (its own proposal)
+                    │
+                    ▼   score = source · phonetic · lexicon · neural · context
+                 friends  ✅  (phonetic 1.00 vs French 0.60)
+```
+
+**Context is what breaks ties.** In `عندي ميتينج مهم بكرة`, `meeting` and `mitten` are phonetically
+identical — the co-occurrence model scores them **0.93 vs 0.50**, and that decides it.
+
+Verified: **12/12** words recalled from Arabic spellings never stored in the index, including
+`kubernetes`, `onboarding` and `microservice`.
 
 **Copy-by-default.** Every path can decline. A span nothing is confident about is
 returned unchanged, because for an ASR post-processor a missed conversion is far cheaper

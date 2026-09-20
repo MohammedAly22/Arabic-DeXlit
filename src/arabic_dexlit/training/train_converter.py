@@ -28,6 +28,8 @@ from ..model.converter import (
     decode_ids,
 )
 from ..convert.gazetteer import Gazetteer
+from ..convert.phonetic import PhoneticIndex
+from ..convert.rerank import ContextModel
 from ..model.acronyms import AcronymInventory
 from ..model.lexicon import OOV_ID, Lexicon
 from ..schema import CATEGORIES
@@ -196,6 +198,26 @@ def train_converter(cfg: dict) -> dict:
     )
     gazetteer.save(out_dir / "gazetteer.json")
     acronyms.save(out_dir / "acronyms.json")
+
+    # The generality stack. The phonetic index is what lets an unseen Arabic
+    # spelling be answered at all -- one English word produces up to 26 distinct
+    # Arabic forms, so a lookup table can never keep up -- and the context model
+    # is what separates "friends" from "French" once several candidates sound
+    # equally plausible.
+    from collections import Counter as _Counter
+
+    span_targets = [
+        s["target"] for r in train_rows for s in r.get("spans", []) if s.get("target")
+    ]
+    lex_counts = _Counter(span_targets)
+    ContextModel().fit(train_rows).save(out_dir / "context_model.json")
+    (out_dir / "lexicon_counts.json").write_text(
+        json.dumps(dict(lex_counts), ensure_ascii=False), encoding="utf-8"
+    )
+    print(
+        f"[hybrid] phonetic index {len(set(span_targets)):,} words | "
+        f"context model over {len(train_rows):,} sentences"
+    )
     print(
         f"[hybrid] gazetteer {len(gazetteer):,} entity forms "
         f"(val exact {gazetteer.coverage(val_rows):.1%}) | "

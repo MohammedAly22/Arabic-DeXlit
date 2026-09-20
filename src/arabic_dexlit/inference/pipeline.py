@@ -30,6 +30,8 @@ from ..model.converter import (
 )
 from ..model.detector import DetectorConfig, SpanDetector, script_of
 from ..convert.gazetteer import Gazetteer
+from ..convert.phonetic import PhoneticIndex
+from ..convert.rerank import CandidateReranker, ContextModel
 from ..convert.router import ConversionRouter
 from ..model.acronyms import AcronymInventory
 from ..model.lexicon import OOV_ID, Lexicon
@@ -125,9 +127,30 @@ class DeXlitPipeline:
         acr_path = path / "acronyms.json"
         gazetteer = Gazetteer.load(gaz_path) if gaz_path.exists() else None
         acronyms = AcronymInventory.load(acr_path) if acr_path.exists() else None
+        # Generality stack: phonetic retrieval proposes words that SOUND like
+        # the span (so an unseen spelling is still answerable), and the reranker
+        # picks among proposals using context.
+        from collections import Counter
+
+        lex_path = path / "lexicon_counts.json"
+        ctx_path = path / "context_model.json"
+        lex_counts = (
+            Counter(json.loads(lex_path.read_text(encoding="utf-8")))
+            if lex_path.exists()
+            else Counter()
+        )
+        phonetic = PhoneticIndex(lex_counts) if lex_counts else None
+        context_model = ContextModel.load(ctx_path) if ctx_path.exists() else None
+        reranker = (
+            CandidateReranker(context_model=context_model, lexicon_counts=lex_counts)
+            if lex_counts or context_model
+            else None
+        )
         router = ConversionRouter(
             acronyms=acronyms,
             gazetteer=gazetteer.mapping if gazetteer else None,
+            phonetic_index=phonetic,
+            reranker=reranker,
         )
         return cls(
             det, conv, tok, device=device, copy_threshold=copy_threshold,
