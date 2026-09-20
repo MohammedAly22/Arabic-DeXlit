@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from arabic_dexlit.data.build import build_corpus  # noqa: E402
+from arabic_dexlit.data.vocab_inject import iter_vocab_sentences  # noqa: E402
 from arabic_dexlit.data.sources import (  # noqa: E402
     iter_monolingual,
     iter_monolingual_remote,
@@ -50,6 +51,12 @@ def main() -> None:
     p.add_argument("--no-sdaia", action="store_true")
     p.add_argument("--no-synthetic", action="store_true")
     p.add_argument(
+        "--vocab-sentences", type=int, default=80000,
+        help="locally synthesised sentences covering real code-switching "
+             "vocabulary (intern, deadline, sprint...), which the harvested "
+             "corpus barely contains; 0 disables",
+    )
+    p.add_argument(
         "--mono-cache", default="data/raw/monolingual.txt",
         help="local cache of monolingual Arabic used for pass-through examples",
     )
@@ -64,6 +71,8 @@ def main() -> None:
         streams.append(iter_sdaia(args.raw_dir))
     if not args.no_synthetic and Path(args.synthetic).exists():
         streams.append(iter_synthetic(args.synthetic))
+    if args.vocab_sentences:
+        streams.append(iter_vocab_sentences(args.vocab_sentences, seed=args.seed))
     if not streams:
         p.error("no sources enabled")
 

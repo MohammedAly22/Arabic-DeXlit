@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .dialects import CATEGORY_PROMPTS, DIALECT_BY_CODE, TOPICS, Dialect
+from .vocab import CODE_SWITCH_VOCAB, SPOKEN_ACRONYMS, vocab_prompt_block
 
 DEFAULT_MODEL = "gemini-3.6-flash"
 _ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -58,7 +59,13 @@ def api_key(explicit: str | None = None) -> str:
     return key
 
 
-def build_prompt(dialect: Dialect, topic: str, category: str, n: int) -> str:
+def build_prompt(
+    dialect: Dialect,
+    topic: str,
+    category: str,
+    n: int,
+    words: list[str] | None = None,
+) -> str:
     """Compose one generation request.
 
     The instructions that protect data quality are the script rules: English
@@ -67,6 +74,16 @@ def build_prompt(dialect: Dialect, topic: str, category: str, n: int) -> str:
     itself, the manufactured input/output pair would collapse.
     """
     emphasis = CATEGORY_PROMPTS[category]
+    # Naming the exact words to use is the whole point of targeted generation:
+    # left to itself the model produces English function words ("the", "to"),
+    # which is what made the harvested corpus useless for real speech.
+    required = ""
+    if words:
+        required = (
+            "\n\nUSE THESE ENGLISH WORDS (at least 4 of them, spread across the "
+            "sentences, in their natural context):\n"
+            + vocab_prompt_block(words, 25)
+        )
     return f"""You are building a research dataset of natural Arabic-English code-switching.
 
 DIALECT: {dialect.name}
@@ -77,7 +94,7 @@ SPEAKER CONTEXT: {topic}
 TASK: Write {n} different sentences of casual, spoken-style {dialect.name} Arabic
 that naturally mix in English, as a real bilingual speaker would text or speak.
 
-{emphasis}
+{emphasis}{required}
 
 STRICT RULES:
 - Write the Arabic in Arabic script, in the {dialect.name} dialect (NOT formal MSA,
@@ -211,21 +228,37 @@ def plan_batches(
     categories: list[str],
     per_batch: int,
     seed: int = 0,
-) -> list[tuple[str, str, str, int]]:
+    vocab_chunk: int = 25,
+) -> list[tuple[str, str, str, int, list[str]]]:
     """Lay out ``(dialect, topic, category, n)`` jobs covering the request evenly.
 
     Spreading across dialect x category x topic in a planned grid, rather than
     sampling independently, keeps rare categories from being starved by chance.
     """
     rng = random.Random(seed)
-    jobs: list[tuple[str, str, str, int]] = []
+    jobs: list[tuple[str, str, str, int, list[str]]] = []
     combos = [(d, c) for d in dialect_codes for c in categories]
     if not combos:
         return jobs
+
+    # Walk the vocabulary in slices so coverage is systematic rather than
+    # random: every word gets its turn instead of the frequent ones dominating.
+    pool = list(CODE_SWITCH_VOCAB)
+    rng.shuffle(pool)
+    cursor = 0
+
     per_combo = max(1, total // (len(combos) * per_batch))
     for d, c in combos:
         for _ in range(per_combo):
-            jobs.append((d, rng.choice(TOPICS), c, per_batch))
+            if c == "ACRONYM":
+                words = rng.sample(SPOKEN_ACRONYMS, min(vocab_chunk, len(SPOKEN_ACRONYMS)))
+            else:
+                if cursor + vocab_chunk > len(pool):
+                    rng.shuffle(pool)
+                    cursor = 0
+                words = pool[cursor : cursor + vocab_chunk]
+                cursor += vocab_chunk
+            jobs.append((d, rng.choice(TOPICS), c, per_batch, words))
     rng.shuffle(jobs)
     return jobs
 
@@ -269,10 +302,10 @@ def synthesize(
     lock = threading.Lock()
     fh = out_path.open("a", encoding="utf-8")
 
-    def run(job: tuple[str, str, str, int]) -> None:
-        code, topic, category, n = job
+    def run(job: tuple[str, str, str, int, list[str]]) -> None:
+        code, topic, category, n, words = job
         dialect = DIALECT_BY_CODE[code]
-        sents = client.generate(build_prompt(dialect, topic, category, n))
+        sents = client.generate(build_prompt(dialect, topic, category, n, words))
         if not sents:
             with lock:
                 stats.batches_failed += 1
@@ -320,7 +353,7 @@ def synthesize(
     # which silently truncated runs to a fraction of the requested total.
     done = threading.Event()
 
-    def guarded(job: tuple[str, str, str, int]) -> None:
+    def guarded(job: tuple[str, str, str, int, list[str]]) -> None:
         if done.is_set():
             return
         run(job)

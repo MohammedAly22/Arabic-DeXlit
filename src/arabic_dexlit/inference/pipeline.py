@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -32,6 +32,7 @@ from ..model.detector import DetectorConfig, SpanDetector, script_of
 from ..model.lexicon import OOV_ID, Lexicon
 from ..schema import ID2TAG, OUTSIDE, spans_from_tags
 from ..training.dataset import build_context
+from .protect import protect as protect_tokens
 
 _WS = re.compile(r"\s+")
 
@@ -43,6 +44,9 @@ class Prediction:
     spans: list[dict]
     tokens: list[str]
     tags: list[str]
+    # Tokens a deterministic rule pinned, with the reason. Useful for showing a
+    # user that a rule -- not the model -- decided a given token.
+    protected: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -65,6 +69,8 @@ class DeXlitPipeline:
         copy_threshold: float | None = None,
         max_length: int = 256,
         lexicon: Lexicon | None = None,
+        use_protection: bool = True,
+        protect_latin: bool = False,
     ) -> None:
         self.device = torch.device(device)
         self.detector = detector.to(self.device).eval()
@@ -73,6 +79,8 @@ class DeXlitPipeline:
         self.copy_threshold = copy_threshold
         self.max_length = max_length
         self.lexicon = lexicon
+        self.use_protection = use_protection
+        self.protect_latin = protect_latin
 
     # --- loading ----------------------------------------------------------
     @classmethod
@@ -191,6 +199,16 @@ class DeXlitPipeline:
 
         tags = self.tag(words)
 
+        # Deterministic protection runs AFTER tagging but BEFORE anything is
+        # converted: emails, URLs, IPs, numbers, dates and times have exactly one
+        # correct output, so a rule decides them and the model's opinion is
+        # discarded. This turns "probably preserved" into "cannot be modified".
+        protections = []
+        if self.use_protection:
+            protections = protect_tokens(words, protect_latin=self.protect_latin)
+            for p in protections:
+                tags[p.index] = OUTSIDE
+
         # The guarantee: nothing flagged => the original string, untouched.
         if all(t == OUTSIDE for t in tags):
             return Prediction(text, False, [], words, tags)
@@ -226,7 +244,12 @@ class DeXlitPipeline:
         out.extend(words[cursor:])
 
         result = " ".join(out)
-        return Prediction(result, result != text, recorded, words, tags)
+        pred = Prediction(result, result != text, recorded, words, tags)
+        pred.protected = [
+            {"index": p.index, "token": p.token, "reason": p.reason}
+            for p in protections
+        ]
+        return pred
 
     def predict_batch(self, texts: list[str]) -> list[Prediction]:
         return [self.predict(t) for t in texts]
