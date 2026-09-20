@@ -86,9 +86,16 @@ _SMOKE = {
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--stage", choices=["detector", "converter", "both"], default="detector")
+    p.add_argument(
+        "--stage",
+        choices=["detector", "converter", "rewriter", "both", "both-rewriter"],
+        default="detector",
+        help="'converter' routes spans; 'rewriter' rewrites the whole sentence "
+             "conditioned on the detector's tags",
+    )
     p.add_argument("--config", default="configs/detector_base.yaml")
     p.add_argument("--converter-config", default="configs/converter_base.yaml")
+    p.add_argument("--rewriter-config", default="configs/rewriter_base.yaml")
     p.add_argument(
         "--smoke", action="store_true",
         help="tiny run on a few hundred examples, to verify the pipeline works",
@@ -112,13 +119,23 @@ def main() -> None:
 
     results: dict = {}
 
-    if args.stage in ("detector", "both"):
+    if args.stage in ("detector", "both", "both-rewriter"):
         from arabic_dexlit.training.train_detector import train_detector
 
         cfg = resolve(args.config)
         print("=== stage 1: span detector ===")
         print(json.dumps({k: v for k, v in cfg.items() if v is not None}, indent=2))
         results["detector"] = train_detector(cfg)
+
+    if args.stage in ("rewriter", "both-rewriter"):
+        from arabic_dexlit.training.train_rewriter import train_rewriter
+
+        rcfg = resolve(args.rewriter_config)
+        if args.stage == "both-rewriter":
+            rcfg["output_dir"] = resolve(args.config)["output_dir"]
+        print("\n=== stage 2: dual-conditioned rewriter ===")
+        print(json.dumps({k: v for k, v in rcfg.items() if v is not None}, indent=2))
+        results["rewriter"] = train_rewriter(rcfg)
 
     if args.stage in ("converter", "both"):
         from arabic_dexlit.training.train_converter import train_converter
