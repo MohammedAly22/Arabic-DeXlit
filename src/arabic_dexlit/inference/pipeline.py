@@ -157,8 +157,17 @@ class DeXlitPipeline:
             [CATEGORY_IDS.get(c, 0) for c in categories], dtype=torch.long
         )
         src_t, cat_t = src_t.to(self.device), cat_t.to(self.device)
-        gen = self.converter.greedy_decode(src_t, cat_t)
-        out = [decode_ids(r) for r in gen.cpu().tolist()]
+
+        # Three tiers, cheapest and safest first:
+        #   1. NAR head  -- one forward pass, cannot produce repetition
+        #   2. word head -- a whole lexicon word, cannot be misspelled
+        #   3. AR decode -- the open-vocabulary fallback
+        cfg = self.converter.cfg
+        if getattr(self.converter, "nar_char_head", None) is not None:
+            out = self.converter.nar_decode(src_t, cat_t)
+        else:
+            gen = self.converter.greedy_decode(src_t, cat_t)
+            out = [decode_ids(r) for r in gen.cpu().tolist()]
 
         # Prefer the word head wherever it is confident: its output is a whole
         # lexicon entry, so it cannot be a misspelling. The character decoder

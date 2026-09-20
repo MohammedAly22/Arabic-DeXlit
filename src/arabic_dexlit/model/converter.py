@@ -151,6 +151,16 @@ class ConverterConfig:
     # one-hot target makes the head slow to become confident enough to fire at
     # all; a little smoothing calibrates it without hurting accuracy.
     word_label_smoothing: float = 0.05
+    # --- non-autoregressive character head ---------------------------------
+    # The autoregressive decoder produced runaway repetition when unsure
+    # ("I'llllllllllllll", "commmmmmunits") -- a decode-loop pathology, not a
+    # knowledge gap. This head predicts the output length and every character
+    # position in ONE forward pass, so repetition is structurally impossible
+    # and CPU inference needs no loop. 97.5% of targets are <= 10 characters,
+    # so a fixed position budget covers the task comfortably.
+    use_nar_head: bool = True
+    nar_max_len: int = 24
+    nar_loss_weight: float = 1.0
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -215,6 +225,20 @@ class SpanConverter(nn.Module):
         else:
             self.word_head = None
 
+        # Non-autoregressive head: one length classifier plus a per-position
+        # character classifier, both read off pooled / projected encoder state.
+        if cfg.use_nar_head:
+            self.nar_len_head = nn.Linear(cfg.d_model, cfg.nar_max_len + 1)
+            self.nar_char_head = nn.Sequential(
+                nn.Linear(cfg.d_model, cfg.d_model),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.d_model, cfg.nar_max_len * cfg.vocab_size),
+            )
+        else:
+            self.nar_len_head = None
+            self.nar_char_head = None
+
     def encode_memory(
         self, src: torch.Tensor, cat: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -229,13 +253,31 @@ class SpanConverter(nn.Module):
         )
         return memory, src_pad
 
+    def _pool(self, memory: torch.Tensor, src_pad: torch.Tensor) -> torch.Tensor:
+        """Masked mean over encoder memory."""
+        keep = (~src_pad).unsqueeze(-1).to(memory.dtype)
+        return (memory * keep).sum(1) / keep.sum(1).clamp(min=1.0)
+
+    def nar_logits(
+        self, memory: torch.Tensor, src_pad: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(length_logits, char_logits)`` for parallel decoding.
+
+        char_logits is ``(batch, nar_max_len, vocab)`` -- every output position
+        predicted at once, so no position can copy its predecessor and run away.
+        """
+        pooled = self._pool(memory, src_pad)
+        length = self.nar_len_head(pooled)
+        chars = self.nar_char_head(pooled).view(
+            pooled.size(0), self.cfg.nar_max_len, self.cfg.vocab_size
+        )
+        return length, chars
+
     def word_logits(self, memory: torch.Tensor, src_pad: torch.Tensor) -> torch.Tensor:
         """Lexicon logits from masked-mean-pooled encoder memory."""
         if self.word_head is None:
             raise RuntimeError("word head is disabled on this model")
-        keep = (~src_pad).unsqueeze(-1).to(memory.dtype)
-        pooled = (memory * keep).sum(1) / keep.sum(1).clamp(min=1.0)
-        return self.word_head(pooled)
+        return self.word_head(self._pool(memory, src_pad))
 
     def _encode(self, src: torch.Tensor, cat: torch.Tensor) -> torch.Tensor:
         x = self.embed(src) * self.scale
@@ -275,11 +317,15 @@ class SpanConverter(nn.Module):
 
         # The word head reads the encoder half of the same forward pass, so
         # training both heads costs one extra matmul, not a second model.
-        if self.word_head is not None:
+        if self.word_head is not None or self.nar_char_head is not None:
             memory = self.transformer.encoder(
                 mem_in, src_key_padding_mask=src_pad
             )
-            res["word_logits"] = self.word_logits(memory, src_pad)
+            if self.word_head is not None:
+                res["word_logits"] = self.word_logits(memory, src_pad)
+            if self.nar_char_head is not None:
+                nl, nc = self.nar_logits(memory, src_pad)
+                res["nar_len_logits"], res["nar_char_logits"] = nl, nc
 
         if tgt_out is not None:
             char_loss = F.cross_entropy(
@@ -290,6 +336,27 @@ class SpanConverter(nn.Module):
             )
             res["char_loss"] = char_loss.detach()
             loss = char_loss
+            if self.nar_char_head is not None and tgt_out is not None:
+                # Target characters, minus EOS/PAD, laid out at fixed positions.
+                b, L = tgt_out.size(0), self.cfg.nar_max_len
+                flat = torch.full((b, L), PAD_ID, dtype=torch.long, device=tgt_out.device)
+                lengths = torch.zeros(b, dtype=torch.long, device=tgt_out.device)
+                for j in range(b):
+                    row = [t for t in tgt_out[j].tolist() if t not in (PAD_ID, EOS_ID, BOS_ID)]
+                    row = row[:L]
+                    lengths[j] = len(row)
+                    if row:
+                        flat[j, : len(row)] = torch.tensor(row, device=tgt_out.device)
+                len_loss = F.cross_entropy(res["nar_len_logits"], lengths)
+                char_loss_nar = F.cross_entropy(
+                    res["nar_char_logits"].reshape(-1, self.cfg.vocab_size),
+                    flat.reshape(-1),
+                    ignore_index=PAD_ID,
+                )
+                nar = len_loss + char_loss_nar
+                res["nar_loss"] = nar.detach()
+                loss = loss + self.cfg.nar_loss_weight * nar
+
             if self.word_head is not None and word_ids is not None:
                 # OOV spans are kept in this loss (not ignored): the head must
                 # learn to *predict* OOV so it abstains rather than guessing a
@@ -302,6 +369,24 @@ class SpanConverter(nn.Module):
                 loss = loss + self.cfg.word_loss_weight * word_loss
             res["loss"] = loss
         return res
+
+    @torch.no_grad()
+    def nar_decode(self, src: torch.Tensor, cat: torch.Tensor) -> list[str]:
+        """Decode every span in ONE forward pass -- no autoregressive loop.
+
+        Because each position is predicted independently from the encoder state,
+        a position cannot condition on (and therefore cannot repeat) the one
+        before it. The runaway outputs the autoregressive decoder produced when
+        unsure -- "I'llllllllllllll", "commmmmmunits" -- are impossible here.
+        """
+        memory, src_pad = self.encode_memory(src, cat)
+        len_logits, char_logits = self.nar_logits(memory, src_pad)
+        lengths = len_logits.argmax(-1).clamp(0, self.cfg.nar_max_len)
+        chars = char_logits.argmax(-1)
+        out: list[str] = []
+        for row, n in zip(chars.cpu().tolist(), lengths.cpu().tolist()):
+            out.append("".join(ITOS.get(c, "") for c in row[:n] if c > UNK_ID))
+        return out
 
     @torch.no_grad()
     def predict_words(

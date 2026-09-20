@@ -37,6 +37,7 @@ _EMAILISH = re.compile(
     r"|^(?:https?://|www\.)\S+$"
 )
 _AFFIX = re.compile(r"^([^\w@]*)(.*?)([^\w@]*)$", re.UNICODE)
+_AL = "ال"  # the Arabic definite article, written fused to its noun
 
 
 @dataclass
@@ -113,7 +114,13 @@ def build_example(
     *,
     dialect: str = "unk",
     source: str = "unk",
-    entity_prob: float = 0.35,
+    # Multi-word targets were only 0.14% of spans, so "Orange Innovation Egypt"
+    # came out as "Orange Inovation Egyph" plus a stray separate "Egypt".
+    # Grouping Title Case runs far more often gives real multi-token signal.
+    entity_prob: float = 0.80,
+    copy_prob: float = 0.35,
+    fuse_al_prob: float = 0.45,
+    add_al_prob: float = 0.18,
 ) -> Example | None:
     """Synthesise the ASR-style input for ``target_sentence`` and tag it.
 
@@ -177,6 +184,28 @@ def build_example(
 
             cat = "ENTITY" if len(cores) > 1 else classify_latin(grp[0])
 
+            # --- COPY case -------------------------------------------------
+            # Real ASR output is mixed: some English arrives already correctly
+            # in Latin script and must be left exactly as it is. Training on
+            # transliterated inputs only taught the model that every flagged
+            # span needs rewriting, so already-correct English was mangled
+            # ("review" -> "so", "deployment" -> "He"). Emitting a share of
+            # spans unconverted teaches copying as an explicit behaviour.
+            if rng.random() < copy_prob:
+                for k, w in enumerate(grp):
+                    src.append(w)
+                    tags.append(("B-" if k == 0 else "I-") + cat)
+                tgt.append(" ".join(grp))
+                spans.append(
+                    {
+                        "start": len(src) - len(grp),
+                        "end": len(src),
+                        "category": cat,
+                        "target": " ".join(c for c in cores),
+                    }
+                )
+                continue
+
             span_start = len(src)
             pieces: list[str] = []
             for core in cores:
@@ -192,6 +221,43 @@ def build_example(
                     tags.append(OUTSIDE)
                     tgt.append(w)
                 continue
+
+            # The Arabic article is written *fused* to the following word, so a
+            # real transcript has السيرفر, not "ال سيرفر". SDAIA always spaces
+            # it, which left the model unable to convert المانجر even though it
+            # handled مانجر perfectly. When the target already carried a
+            # separate "ال" before this span, fuse it onto the surface form and
+            # drop the standalone token.
+            if (
+                cat in ("CS", "ENTITY")
+                and src
+                and src[-1] == _AL
+                and tags[-1] == OUTSIDE
+                and rng.random() < fuse_al_prob
+            ):
+                src.pop()
+                tags.pop()
+                if tgt and tgt[-1] == _AL:
+                    tgt.pop()
+                pieces[0] = _AL + pieces[0]
+                lead = ""
+                # span_start was captured before the pop, so it now points one
+                # token too far right; recompute it against the shortened list.
+                span_start = len(src)
+            elif (
+                cat == "CS"
+                and len(cores) == 1
+                and rng.random() < add_al_prob
+            ):
+                # Only 12.5% of SDAIA sentences even contain a standalone ال
+                # before English, so fusing an existing one caps coverage near
+                # 1%. Speakers routinely say "السيرفر" where the written corpus
+                # has none, so the article is *synthesised* here -- the input
+                # gains it while the English target stays clean.
+                pieces[0] = _AL + pieces[0]
+                # span_start was captured before the pop, so it now points one
+                # token too far right; recompute it against the shortened list.
+                span_start = len(src)
 
             # Re-attach punctuation so the synthesised input reads naturally.
             pieces[0] = lead + pieces[0]

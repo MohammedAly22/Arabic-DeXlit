@@ -168,6 +168,41 @@ def test_word_head_can_be_disabled():
     assert out["loss"].requires_grad
 
 
+def test_nar_head_decodes_without_a_loop():
+    """One forward pass, bounded length, and no autoregressive decoding."""
+    lex = Lexicon.from_spans(["intern", "intern", "offer", "offer"], min_count=2)
+    cfg = ConverterConfig(d_model=64, nhead=2, num_encoder_layers=1,
+                          num_decoder_layers=1, dim_feedforward=128,
+                          use_word_head=True, lexicon_size=len(lex),
+                          use_nar_head=True, nar_max_len=12)
+    m = SpanConverter(cfg)
+    src = torch.randint(4, 50, (3, 10))
+    cat = torch.zeros(3, dtype=torch.long)
+    out = m(src, cat, torch.randint(4, 50, (3, 6)), torch.randint(4, 50, (3, 6)),
+            word_ids=torch.tensor([1, 2, 1]))
+    assert out["nar_char_logits"].shape == (3, 12, cfg.vocab_size)
+    assert out["nar_len_logits"].shape == (3, cfg.nar_max_len + 1)
+    assert "nar_loss" in out
+    out["loss"].backward()
+
+    m.eval()
+    got = m.nar_decode(src, cat)
+    assert len(got) == 3
+    # Length is capped by construction, so runaway output is impossible.
+    assert all(len(g) <= cfg.nar_max_len for g in got)
+
+
+def test_nar_head_can_be_disabled():
+    cfg = ConverterConfig(d_model=64, nhead=2, num_encoder_layers=1,
+                          num_decoder_layers=1, dim_feedforward=128,
+                          use_word_head=False, use_nar_head=False)
+    m = SpanConverter(cfg)
+    assert m.nar_char_head is None
+    out = m(torch.randint(4, 50, (2, 8)), torch.zeros(2, dtype=torch.long),
+            torch.randint(4, 50, (2, 5)), torch.randint(4, 50, (2, 5)))
+    assert "nar_char_logits" not in out
+
+
 def test_converter_stays_small_enough():
     """Stage 2 must stay far below a pretrained byte model (~300M).
 
