@@ -29,6 +29,9 @@ from ..model.converter import (
     encode_chars,
 )
 from ..model.detector import DetectorConfig, SpanDetector, script_of
+from ..convert.gazetteer import Gazetteer
+from ..convert.router import ConversionRouter
+from ..model.acronyms import AcronymInventory
 from ..model.lexicon import OOV_ID, Lexicon
 from ..schema import ID2TAG, OUTSIDE, spans_from_tags
 from ..training.dataset import build_context
@@ -71,6 +74,7 @@ class DeXlitPipeline:
         lexicon: Lexicon | None = None,
         use_protection: bool = True,
         protect_latin: bool = False,
+        router: "ConversionRouter | None" = None,
     ) -> None:
         self.device = torch.device(device)
         self.detector = detector.to(self.device).eval()
@@ -81,6 +85,7 @@ class DeXlitPipeline:
         self.lexicon = lexicon
         self.use_protection = use_protection
         self.protect_latin = protect_latin
+        self.router = router
 
     # --- loading ----------------------------------------------------------
     @classmethod
@@ -112,9 +117,21 @@ class DeXlitPipeline:
 
         lex_path = path / "lexicon.json"
         lexicon = Lexicon.load(lex_path) if lex_path.exists() else None
+
+        # The deterministic halves of the hybrid: an acronym inventory and an
+        # entity gazetteer, both learned at training time and saved beside the
+        # weights so inference needs no extra setup.
+        gaz_path = path / "gazetteer.json"
+        acr_path = path / "acronyms.json"
+        gazetteer = Gazetteer.load(gaz_path) if gaz_path.exists() else None
+        acronyms = AcronymInventory.load(acr_path) if acr_path.exists() else None
+        router = ConversionRouter(
+            acronyms=acronyms,
+            gazetteer=gazetteer.mapping if gazetteer else None,
+        )
         return cls(
             det, conv, tok, device=device, copy_threshold=copy_threshold,
-            lexicon=lexicon,
+            lexicon=lexicon, router=router,
         )
 
     # --- detection --------------------------------------------------------
@@ -220,9 +237,34 @@ class DeXlitPipeline:
         # Same context format the converter was trained on -- a bare span would
         # be out of distribution and reintroduces the ambiguity context solves.
         window = getattr(self.converter.cfg, "context_window", 0) if self.converter else 0
-        texts = [build_context(words, s, e, window) for s, e, _ in spans]
-        cats = [c for _, _, c in spans]
-        converted = self.convert_spans(texts, cats)
+
+        # Deterministic first: parsers for EMAIL/URL/NUMBER/TIME, the acronym
+        # inventory, and the entity gazetteer. These are exact when they apply,
+        # so they should never be second-guessed by a model.
+        routed: dict[int, str] = {}
+        remaining = list(range(len(spans)))
+        if self.router is not None:
+            jobs = [(words[s:e], c, words) for s, e, c in spans]
+            for i, res in enumerate(self.router.convert(jobs)):
+                if res.source in ("parser", "acronym", "gazetteer"):
+                    routed[i] = res.text
+            remaining = [i for i in range(len(spans)) if i not in routed]
+
+        # Whatever is left is genuinely ambiguous -- that is the neural model's job.
+        converted: list[str] = [""] * len(spans)
+        for i, t in routed.items():
+            converted[i] = t
+        if remaining:
+            from ..convert.translit_rules import transliterate_span
+
+            texts, cats = [], []
+            for i in remaining:
+                st, en, c = spans[i]
+                prior = transliterate_span(words[st:en]) if window else None
+                texts.append(build_context(words, st, en, window, prior))
+                cats.append(c)
+            for i, t in zip(remaining, self.convert_spans(texts, cats)):
+                converted[i] = t
 
         out: list[str] = []
         cursor = 0

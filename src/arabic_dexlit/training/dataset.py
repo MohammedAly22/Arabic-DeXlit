@@ -24,6 +24,7 @@ from ..model.converter import (
     CATEGORY_IDS,
     EOS_ID,
     PAD_ID,
+    PRIOR_SEP,
     SPAN_CLOSE,
     SPAN_OPEN,
     encode_chars,
@@ -133,7 +134,11 @@ def collate_detector(batch: list[dict], pad_id: int = 0) -> dict:
 
 
 def build_context(
-    tokens: list[str], start: int, end: int, window: int = 3
+    tokens: list[str],
+    start: int,
+    end: int,
+    window: int = 3,
+    rule_prior: str | None = None,
 ) -> str:
     """Wrap a span in its surrounding words, with explicit boundary markers.
 
@@ -145,12 +150,21 @@ def build_context(
     Arabic ال in context is the article (leave it) rather than a transliteration
     of "la", which it cannot possibly know from the span alone.
     """
-    if window <= 0:
-        return " ".join(tokens[start:end])
-    left = tokens[max(0, start - window) : start]
-    right = tokens[end : end + window]
     span = tokens[start:end]
-    return " ".join([*left, SPAN_OPEN, *span, SPAN_CLOSE, *right])
+    if window <= 0:
+        core = " ".join(span)
+    else:
+        left = tokens[max(0, start - window) : start]
+        right = tokens[end : end + window]
+        core = " ".join([*left, SPAN_OPEN, *span, SPAN_CLOSE, *right])
+
+    # Append the rule-based transliteration as a PRIOR, after a separator. The
+    # model starts from a phonetic skeleton ("mitinj") instead of nothing, and
+    # learns to correct it ("meeting") rather than derive it. The rules are a
+    # hypothesis, never the answer -- ambiguity is exactly what the model is for.
+    if rule_prior:
+        core = f"{core} {PRIOR_SEP} {rule_prior}"
+    return core
 
 
 class ConverterDataset(Dataset):
@@ -169,8 +183,10 @@ class ConverterDataset(Dataset):
         dedupe: bool = True,
         lexicon=None,
         context_window: int = 3,
+        use_rule_prior: bool = True,
     ) -> None:
         self.context_window = context_window
+        self.use_rule_prior = use_rule_prior
         self.max_src_len = max_src_len
         self.max_tgt_len = max_tgt_len
         self.lexicon = lexicon
@@ -190,7 +206,12 @@ class ConverterDataset(Dataset):
                 # a span in isolation and cannot tell Arabic ال ("the") from a
                 # transliterated English word -- the observed failure was
                 # ال -> "la", و -> "we", ان -> "na".
-                ctx = build_context(toks, start, end, self.context_window)
+                prior = None
+                if self.use_rule_prior:
+                    from ..convert.translit_rules import transliterate_span
+
+                    prior = transliterate_span(toks[start:end])
+                ctx = build_context(toks, start, end, self.context_window, prior)
                 key = (ctx, tgt, cat)
                 if dedupe and key in seen:
                     continue

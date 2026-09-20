@@ -72,16 +72,28 @@ Arabic-DeXlit splits the problem in two.
 [MARBERTv2](https://huggingface.co/UBC-NLP/MARBERTv2), chosen because it is pretrained on
 *dialectal* Arabic rather than MSA. Each token gets one tag. `O` means *copy this verbatim*.
 
-**2️⃣ Stage 2 — the converter.** A ~53M-parameter **context-aware** model with two heads:
+**2️⃣ Stage 2 — a typed hybrid converter.** Each detected span is routed by its
+category, on one principle: **deterministic where structure exists, neural where ambiguity exists.**
 
-- a **word head** over a ~15K-word lexicon, which emits a whole dictionary word (so it cannot
-  misspell) and runs no decode loop at all;
-- a **character head** for everything else, keeping the vocabulary open for brand names and URLs.
+| Category | Path | Why |
+|:--|:--|:--|
+| 📧 `EMAIL` · 🔗 `URL` · 🔢 `NUMBER` · 🕐 `TIME` | **Parser** | `احمد ات جيميل دوت كوم` → `ahmed@gmail.com` is a *parse*, not an inference. `ات`=`@`, `دوت`=`.`. A decoder asked to generate this can hallucinate a domain or drop a dot; a parser cannot. |
+| 🔠 `ACRONYM` | **Closed inventory** | `ايه اي` → `AI` has a finite answer set. Scored against an inventory, so the output is always a real, correctly-cased acronym. |
+| 🏢 `ENTITY` | **Gazetteer → neural** | `مكروسوفت تيمس` → `Microsoft Teams` is entity *resolution*. No character mapping recovers the capital T. Measured on the corpus: 3,386 forms, only **7** ambiguous. |
+| 💬 `CS` | **Neural + rule prior + context** | Genuinely ambiguous — `ميتينج` maps equally to `meting` or `meeting`. The model sees the span in its sentence *plus* the rule-based skeleton. |
 
-It sees the span **inside its surrounding sentence**, marked off with delimiters:
-`مع ‹ ال › سبيتش ايه اي`. Without that context a span is ambiguous in isolation — an early model
-converted the Arabic article `ال` into `"la"` simply because it could not see the neighbours that
-make it an article.
+**The rule transliterator is a prior, not an answer.** `فريندس → frinds` is phonetically
+right and orthographically wrong, so it is fed to the model as evidence rather than used
+directly: the model corrects a skeleton instead of deriving one from nothing.
+
+```
+عندي ‹ ميتينج › مهم النهارده ‖ mitinj   →   meeting
+      └─ span in context ─┘   └ prior ┘
+```
+
+**Copy-by-default.** Every path can decline. A span nothing is confident about is
+returned unchanged, because for an ASR post-processor a missed conversion is far cheaper
+than a corrupted one.
 
 ### 💡 Why this design earns its keep
 
@@ -291,9 +303,16 @@ src/arabic_dexlit/
 │   ├── build.py           🧱  leak-free splitting and dataset assembly
 │   ├── hub.py             ☁️  pull the prebuilt corpus from the Hub
 │   └── dialects.py        🌍  dialect registry and generation prompts
+├── convert/               🔀  the typed hybrid router
+│   ├── parsers.py         📧  EMAIL / URL / NUMBER / TIME -- exact or decline
+│   ├── translit_rules.py  🔤  Arabic → Latin skeleton, used as a prior
+│   ├── gazetteer.py       🏢  entity resolution (3,386 forms, 7 ambiguous)
+│   └── router.py          🚦  routes by category, copy-by-default
 ├── model/
 │   ├── detector.py        1️⃣  stage 1: tagger + script features + copy gate
-│   └── converter.py       2️⃣  stage 2: tiny char-level transformer
+│   ├── converter.py       2️⃣  stage 2: char transformer + word head + NAR head
+│   ├── acronyms.py        🔠  closed acronym inventory
+│   └── lexicon.py         📖  closed-vocabulary word head
 ├── training/
 │   ├── dataset.py         📦  torch datasets; sub-word label projection
 │   ├── metrics.py         📊  span F1 + the safety metrics
@@ -306,7 +325,7 @@ src/arabic_dexlit/
 scripts/    build_dataset.py · synthesize_data.py · export_dataset.py · train.py · evaluate.py
 configs/    detector_base.yaml · detector_t4.yaml · converter_base.yaml
 notebooks/  ArabicDeXlit_Train_Colab.ipynb
-tests/      test_pairing.py · test_models.py
+tests/      test_pairing.py · test_models.py · test_pipeline.py · test_hybrid.py
 ```
 
 ## 🧪 Tests
@@ -314,6 +333,8 @@ tests/      test_pairing.py · test_models.py
 ```bash
 python tests/test_pairing.py    # data invariants
 python tests/test_models.py     # model shapes, gradients, decoding
+python tests/test_pipeline.py   # protection layer, acronyms, UMR metric
+python tests/test_hybrid.py     # parsers, rules, gazetteer, routing
 ```
 
 The data tests assert the invariants that would otherwise fail **silently** — tag/token alignment,

@@ -27,6 +27,8 @@ from ..model.converter import (
     SpanConverter,
     decode_ids,
 )
+from ..convert.gazetteer import Gazetteer
+from ..model.acronyms import AcronymInventory
 from ..model.lexicon import OOV_ID, Lexicon
 from ..schema import CATEGORIES
 from .dataset import (
@@ -177,6 +179,28 @@ def train_converter(cfg: dict) -> dict:
     )
     if not len(train_ds):
         raise SystemExit("no span pairs found -- build the dataset first")
+
+    # Learn the deterministic halves of the hybrid from the SAME training rows,
+    # then save them beside the weights. Measured on the corpus these are close
+    # to lookup tables -- 3,386 entity forms with only 7 ambiguous -- so they
+    # answer most structured spans exactly and the model only sees the rest.
+    gazetteer = Gazetteer.from_corpus(train_rows)
+    acronyms = AcronymInventory.from_corpus(
+        [
+            s["target"]
+            for r in train_rows
+            for s in r.get("spans", [])
+            if s["category"] == "ACRONYM"
+        ],
+        min_count=1,
+    )
+    gazetteer.save(out_dir / "gazetteer.json")
+    acronyms.save(out_dir / "acronyms.json")
+    print(
+        f"[hybrid] gazetteer {len(gazetteer):,} entity forms "
+        f"(val exact {gazetteer.coverage(val_rows):.1%}) | "
+        f"acronym inventory {len(acronyms):,}"
+    )
 
     train_loader = DataLoader(
         train_ds,

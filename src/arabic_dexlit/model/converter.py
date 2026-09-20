@@ -64,13 +64,15 @@ PAD_ID, BOS_ID, EOS_ID, UNK_ID = 0, 1, 2, 3
 # Single characters (not multi-char tags) so the character tokenizer handles
 # them naturally, and guillemets because they never occur in Arabic ASR output.
 SPAN_OPEN, SPAN_CLOSE = "‹", "›"
+# Separates the span-in-context from the rule-based transliteration prior.
+PRIOR_SEP = "‖"
 
 # Arabic letters actually produced by ASR, plus the Latin output alphabet.
 _ARABIC_CHARS = "ابتثجحخدذرزسشصضطظعغفقكلمنهوىيئءأإآةپچڤگژ"
 _ARABIC_MARKS = "ًٌٍَُِّْـ"
 _LATIN_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _DIGITS = "0123456789"
-_PUNCT = " .,!?-_@/:'&+#%()" + SPAN_OPEN + SPAN_CLOSE
+_PUNCT = " .,!?-_@/:'&+#%()" + SPAN_OPEN + SPAN_CLOSE + PRIOR_SEP
 
 
 def build_vocab() -> tuple[dict[str, int], dict[int, str]]:
