@@ -1,0 +1,56 @@
+# ArabicDeXlit -- end-to-end rewriter, tuned for H100 / H200 (80-150GB).
+#
+# The default config left an H200 at ~13GB of 150GB and 0.78 steps/s. The causes
+# were gradient checkpointing (unnecessary with this much VRAM), a batch of 8,
+# padding to 512, and a dataloader that respawned its workers every epoch.
+#
+#   python scripts/train.py --stage seq2seq --config configs/seq2seq_h100.yaml
+
+model_name: google/byt5-base
+
+data_dir: data/processed
+output_dir: outputs/dexlit-s2s
+max_train_examples: null
+max_eval_examples: 2000
+
+task_prefix: "restore code-switching: "
+
+# Measured on this corpus: source p99 is 417 bytes, target p99 is 393. Padding
+# to 512 wasted compute quadratically in attention; 448 covers >99% and batches
+# are additionally length-grouped, so most batches are far shorter than this.
+max_source_length: 448
+max_target_length: 448
+dropout_rate: 0.1
+label_smoothing: 0.1
+
+num_beams: 4
+length_penalty: 1.0
+no_repeat_ngram_size: 0
+
+# Batch together sentences of similar length. A batch costs as much as its
+# longest member, so this alone cut padded compute 2.3x on this corpus.
+group_by_length: true
+
+epochs: 3
+weight_decay: 0.01
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+seed: 42
+
+log_every: 50
+eval_every: 1000
+eval_max_batches: 12
+umr_penalty: 1.0
+
+wandb_project: arabic-dexlit
+
+# With 80GB+ there is no reason to trade throughput for memory: checkpointing
+# costs roughly 30-40% speed to save memory that is not scarce here.
+gradient_checkpointing: false
+batch_size: 128
+eval_batch_size: 128
+grad_accum: 2          # effective batch 256
+# Scaled for the larger batch: 1e-4 was tuned for an effective batch of 64.
+learning_rate: 3.0e-4
+num_workers: 16
+prefetch_factor: 6

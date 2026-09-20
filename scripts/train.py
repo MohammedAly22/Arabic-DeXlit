@@ -72,6 +72,9 @@ _OVERRIDES: dict[str, type] = {
     "model_name": str,
     "num_beams": int,
     "umr_penalty": float,
+    "gradient_checkpointing": bool,
+    "group_by_length": bool,
+    "prefetch_factor": int,
 }
 
 _SMOKE = {
@@ -125,7 +128,7 @@ def main() -> None:
         from arabic_dexlit.training.train_seq2seq import train_seq2seq
 
         cfg = resolve(args.config if args.config != "configs/detector_base.yaml"
-                      else "configs/seq2seq_base.yaml")
+                      else "configs/seq2seq_h100.yaml")
         print("=== end-to-end sentence rewriter ===")
         print(json.dumps({k: v for k, v in cfg.items() if v is not None}, indent=2))
         results["seq2seq"] = train_seq2seq(cfg)

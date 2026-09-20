@@ -62,6 +62,54 @@ class Seq2SeqDataset(Dataset):
         return enc
 
 
+class LengthGroupedSampler(torch.utils.data.Sampler):
+    """Batch together sentences of similar length.
+
+    Padding is per-batch, so a batch is as expensive as its *longest* member.
+    With random batching a single 500-byte outlier forces 500 bytes of compute
+    on every other sequence in the batch, and attention cost is quadratic in
+    that length. Measured on this corpus the median source is 111 bytes against
+    a p99 of 417, so random batching wastes most of the work.
+
+    Shuffling happens inside a large megabatch before sorting, and the batch
+    order is shuffled afterwards, so grouping costs no real randomness.
+    """
+
+    def __init__(self, lengths: list[int], batch_size: int, shuffle: bool = True,
+                 megabatch_mult: int = 50, seed: int = 0) -> None:
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.mega = batch_size * megabatch_mult
+        self.seed = seed
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return len(self.lengths)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        import random as _random
+
+        rng = _random.Random(self.seed + self.epoch)
+        idx = list(range(len(self.lengths)))
+        if self.shuffle:
+            rng.shuffle(idx)
+
+        batches: list[list[int]] = []
+        for i in range(0, len(idx), self.mega):
+            chunk = idx[i : i + self.mega]
+            chunk.sort(key=lambda j: self.lengths[j])
+            for k in range(0, len(chunk), self.batch_size):
+                batches.append(chunk[k : k + self.batch_size])
+        if self.shuffle:
+            rng.shuffle(batches)
+        for b in batches:
+            yield from b
+
+
 class Seq2SeqCollator:
     """Pads a batch. Picklable, so ``num_workers > 0`` works under spawn."""
 
@@ -144,6 +192,14 @@ def evaluate(
 def train_seq2seq(cfg: dict) -> dict:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if device.type == "cuda":
+        # TF32 matmuls are free accuracy-wise for this task and a large win on
+        # Ampere and newer; off by default in PyTorch, which leaves most of an
+        # H100/H200's matmul throughput unused.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     amp, amp_dtype = pick_amp(device)
     torch.manual_seed(cfg.get("seed", 42))
 
@@ -172,16 +228,39 @@ def train_seq2seq(cfg: dict) -> dict:
     print(f"[data] train={len(train_rows):,} val={len(val_rows):,}")
 
     collate = Seq2SeqCollator(tok)
+    workers = cfg.get("num_workers", 4)
+    batch_size = cfg.get("batch_size", 16)
+
+    sampler = None
+    shuffle = True
+    if cfg.get("group_by_length", True):
+        # Byte length is what drives cost, and it is known without tokenising.
+        lens = [len(r["src"].encode("utf-8")) for r in train_rows]
+        sampler = LengthGroupedSampler(lens, batch_size, shuffle=True,
+                                       seed=cfg.get("seed", 42))
+        shuffle = False
+        import statistics
+
+        print(f"[data] length-grouped batching: median {statistics.median(lens):.0f} "
+              f"bytes, max {max(lens)}")
+
     train_loader = DataLoader(
         Seq2SeqDataset(train_rows, tok, mcfg),
-        batch_size=cfg.get("batch_size", 16), shuffle=True, collate_fn=collate,
-        num_workers=cfg.get("num_workers", 4),
+        batch_size=batch_size, shuffle=shuffle, sampler=sampler, collate_fn=collate,
+        num_workers=workers,
         pin_memory=device.type == "cuda", drop_last=True,
+        # Without persistent workers the pool is torn down and respawned every
+        # epoch; without a deeper prefetch each worker queues only two batches,
+        # which is not enough to keep a fast GPU fed.
+        persistent_workers=workers > 0,
+        prefetch_factor=cfg.get("prefetch_factor", 4) if workers > 0 else None,
     )
     val_loader = DataLoader(
         Seq2SeqDataset(val_rows, tok, mcfg),
         batch_size=cfg.get("eval_batch_size", 16), shuffle=False,
-        collate_fn=collate, num_workers=cfg.get("num_workers", 4),
+        collate_fn=collate, num_workers=workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=workers > 0,
     )
 
     epochs = cfg.get("epochs", 3)
@@ -229,6 +308,8 @@ def train_seq2seq(cfg: dict) -> dict:
 
     model.train()
     for epoch in range(epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)   # otherwise every epoch repeats the same batches
         running = 0.0
         for i, batch in enumerate(train_loader):
             batch.pop("rows")
@@ -237,7 +318,7 @@ def train_seq2seq(cfg: dict) -> dict:
                 with torch.autocast(device.type, dtype=amp_dtype, enabled=amp):
                     loss = model(**batch).loss / accum
                 scaler.scale(loss).backward()
-                running += float(loss) * accum
+                running += loss.detach().item() * accum
             except torch.OutOfMemoryError:
                 oom_skipped += 1
                 optim.zero_grad(set_to_none=True)
