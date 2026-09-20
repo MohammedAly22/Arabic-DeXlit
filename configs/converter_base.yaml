@@ -20,7 +20,7 @@ num_encoder_layers: 6
 num_decoder_layers: 6
 dim_feedforward: 2048
 dropout: 0.1
-max_src_len: 96
+max_src_len: 64   # p99 of context length is 54 chars; attention cost is quadratic in this
 max_tgt_len: 40
 
 # Words of surrounding context on each side of the span. Without this the
@@ -50,12 +50,15 @@ word_confidence: 0.90
 # that will not finish in one Colab session. A larger batch is nearly free here
 # and cuts the step count ~5x.
 epochs: 8
-batch_size: 1024
-eval_batch_size: 1024
+# 1024 exhausted a 40GB A100 once max_src_len grew to hold context: the 6+6
+# layer attention activations scale with batch x len^2. 384 with the shorter
+# source length keeps the step count low while leaving headroom.
+batch_size: 384
+eval_batch_size: 512
 # Scaled with the batch (linear-scaling rule, capped): 3e-4 was tuned for 192,
 # and keeping it at a 5x larger batch spends most of the speedup on slower
 # convergence per step.
-learning_rate: 1.0e-3
+learning_rate: 6.0e-4
 weight_decay: 0.01
 warmup_ratio: 0.05
 max_grad_norm: 1.0

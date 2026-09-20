@@ -13,6 +13,7 @@ output string.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -68,8 +69,13 @@ def evaluate(
             )
         losses.append(float(out["loss"]))
 
-        gen = model.greedy_decode(batch["src"], batch["category"])
-        preds = [decode_ids(r) for r in gen.cpu().tolist()]
+        # Prefer the non-autoregressive head at eval: one forward pass instead
+        # of a decode loop over every batch, and it cannot emit repetition.
+        if getattr(model, "nar_char_head", None) is not None:
+            preds = model.nar_decode(batch["src"], batch["category"])
+        else:
+            gen = model.greedy_decode(batch["src"], batch["category"])
+            preds = [decode_ids(r) for r in gen.cpu().tolist()]
 
         # Hybrid: where the word head is confident and does not predict OOV, its
         # answer is a whole dictionary word and therefore cannot be misspelled.
@@ -108,6 +114,10 @@ def evaluate(
 
 
 def train_converter(cfg: dict) -> dict:
+    # Attention activations here are large and short-lived, which fragments the
+    # allocator; expandable segments let it reuse those blocks instead of
+    # failing with memory still reserved but unusable.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp, amp_dtype = pick_amp(device)
     torch.manual_seed(cfg.get("seed", 42))
@@ -219,6 +229,7 @@ def train_converter(cfg: dict) -> dict:
             print(f"[wandb] disabled: {e}")
 
     best_em = -1.0
+    oom_skipped = 0
     step = 0
     log_every = cfg.get("log_every", 50)
     eval_every = cfg.get("eval_every", 500)
@@ -229,14 +240,26 @@ def train_converter(cfg: dict) -> dict:
         running = 0.0
         for batch in train_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            with torch.autocast(device.type, dtype=amp_dtype, enabled=amp):
-                out = model(
-                    batch["src"], batch["category"], batch["tgt_in"],
-                    batch["tgt_out"], word_ids=batch.get("word_ids"),
-                )
-                loss = out["loss"]
-            optim.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            try:
+                with torch.autocast(device.type, dtype=amp_dtype, enabled=amp):
+                    out = model(
+                        batch["src"], batch["category"], batch["tgt_in"],
+                        batch["tgt_out"], word_ids=batch.get("word_ids"),
+                    )
+                    loss = out["loss"]
+                optim.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+            except torch.OutOfMemoryError:
+                # One oversized batch must not end a multi-hour run. Drop it,
+                # release the cache, and continue with the next.
+                oom_skipped += 1
+                optim.zero_grad(set_to_none=True)
+                del batch
+                torch.cuda.empty_cache()
+                if oom_skipped in (1, 10, 100):
+                    print(f"[warn ] skipped {oom_skipped} batch(es) after CUDA OOM "
+                          f"-- lower batch_size if this keeps happening", flush=True)
+                continue
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("max_grad_norm", 1.0))
             scaler.step(optim)
