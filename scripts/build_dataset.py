@@ -76,8 +76,10 @@ def main() -> None:
         help="local cache of monolingual Arabic used for pass-through examples",
     )
     p.add_argument(
-        "--fetch-mono", type=int, default=0,
-        help="download this many monolingual sentences into the cache first",
+        "--fetch-mono", type=int, default=150000,
+        help="monolingual Arabic to download for pass-through examples; these "
+             "are what teach the model to leave ordinary text alone, so the "
+             "default fetches them rather than silently building without",
     )
     args = p.parse_args()
 

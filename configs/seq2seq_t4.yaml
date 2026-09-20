@@ -14,11 +14,12 @@ max_eval_examples: 2000
 
 task_prefix: "restore code-switching: "
 
-# Measured on this corpus: source p99 is 417 bytes, target p99 is 393. Padding
-# to 512 wasted compute quadratically in attention; 448 covers >99% and batches
-# are additionally length-grouped, so most batches are far shorter than this.
-max_source_length: 448
-max_target_length: 448
+# Measured after the collision fix: source median 101 bytes, p99 167; target
+# median 69, p99 123. Attention cost is quadratic in this, so the earlier 512
+# budget was spending most of its compute on padding. Batches are additionally
+# length-grouped, so a typical batch is shorter still.
+max_source_length: 224
+max_target_length: 192
 dropout_rate: 0.1
 label_smoothing: 0.1
 

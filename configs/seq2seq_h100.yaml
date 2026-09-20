@@ -15,11 +15,12 @@ max_eval_examples: 2000
 
 task_prefix: "restore code-switching: "
 
-# Measured on this corpus: source p99 is 417 bytes, target p99 is 393. Padding
-# to 512 wasted compute quadratically in attention; 448 covers >99% and batches
-# are additionally length-grouped, so most batches are far shorter than this.
-max_source_length: 448
-max_target_length: 448
+# Measured after the collision fix: source median 101 bytes, p99 167; target
+# median 69, p99 123. Attention cost is quadratic in this, so the earlier 512
+# budget was spending most of its compute on padding. Batches are additionally
+# length-grouped, so a typical batch is shorter still.
+max_source_length: 224
+max_target_length: 192
 dropout_rate: 0.1
 label_smoothing: 0.1
 
@@ -46,12 +47,16 @@ wandb_project: arabic-dexlit
 
 # With 80GB+ there is no reason to trade throughput for memory: checkpointing
 # costs roughly 30-40% speed to save memory that is not scarce here.
-# Measured on an H200: batch 72 at length 448 peaks at 120GB of 150GB, and 64
-# leaves headroom for the length outliers the synthetic probe does not contain.
+# Measured on an H200 with scripts/diagnose_gpu.py:
+#   checkpointing ON , batch 1725 -> 223 samples/s @ 111GB
+#   checkpointing OFF, batch  162 -> 289 samples/s @ 121GB
+# Off is 1.29x faster despite a 10x smaller batch, because recomputing the
+# forward pass costs more than the memory it saves is worth on a 150GB card.
+# 128 leaves headroom for length outliers the synthetic probe does not contain.
 gradient_checkpointing: false
-batch_size: 64
-eval_batch_size: 64
-grad_accum: 4          # effective batch 256
+batch_size: 128
+eval_batch_size: 128
+grad_accum: 2          # effective batch 256
 # Scaled for the larger batch: 1e-4 was tuned for an effective batch of 64.
 learning_rate: 3.0e-4
 num_workers: 16
