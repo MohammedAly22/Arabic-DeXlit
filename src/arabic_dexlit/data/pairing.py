@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass, field
 
 from ..schema import OUTSIDE
+from .collisions import collides
 from .translit import (
     LEXICON,
     speak_email,
@@ -95,8 +96,15 @@ def _split_affix(tok: str) -> tuple[str, str, str]:
     return m.group(1), m.group(2), m.group(3)
 
 
-def _render(core: str, cat: str, rng: random.Random) -> list[str]:
-    """Render one Latin core in Arabic script under the given policy."""
+def _render(core: str, cat: str, rng: random.Random, *, tries: int = 6) -> list[str] | None:
+    """Render one Latin core in Arabic script under the given policy.
+
+    Returns ``None`` when every sampled rendering collides with a real Arabic
+    word. Short English words transliterate into genuine Arabic ("mall" -> مال
+    which means "money", "the" -> ذي), and such a pair teaches the model to
+    convert a word it must leave alone. Measured before this guard, 9% of spans
+    were affected.
+    """
     if cat == "EMAIL":
         return speak_email(core, rng).split()
     if cat == "NUMBER":
@@ -104,8 +112,16 @@ def _render(core: str, cat: str, rng: random.Random) -> list[str]:
     if cat == "ACRONYM":
         return spell_acronym(core, rng).split()
     low = core.lower()
-    form = rng.choice(LEXICON[low]) if low in LEXICON else transliterate_word(core, rng)
-    return form.split()
+    if low in LEXICON:
+        return rng.choice(LEXICON[low]).split()
+
+    # The transliterator is stochastic, so a colliding sample can simply be
+    # redrawn; only give up when the word has no safe rendering at all.
+    for _ in range(tries):
+        form = transliterate_word(core, rng)
+        if not collides(form):
+            return form.split()
+    return None
 
 
 def build_example(
@@ -208,12 +224,30 @@ def build_example(
 
             span_start = len(src)
             pieces: list[str] = []
+            unsafe = False
             for core in cores:
                 # Within an ENTITY run, an acronym is still *spoken* letter by
                 # letter ("Arabic NLP" -> ... ان ال بي), so each core keeps its
                 # own pronunciation policy even though the span is one unit.
                 piece_cat = classify_latin(core) if cat == "ENTITY" else cat
-                pieces.extend(_render(core, piece_cat, rng))
+                rendered = _render(core, piece_cat, rng)
+                if rendered is None:
+                    unsafe = True
+                    break
+                pieces.extend(rendered)
+
+            if unsafe or not pieces:
+                # No safe transliteration: emit the word as a COPY span instead,
+                # which is true (already-correct English) rather than wrong.
+                for k, w in enumerate(grp):
+                    src.append(w)
+                    tags.append(("B-" if k == 0 else "I-") + cat)
+                tgt.append(" ".join(grp))
+                spans.append({
+                    "start": len(src) - len(grp), "end": len(src),
+                    "category": cat, "target": " ".join(cores),
+                })
+                continue
 
             if not pieces:
                 for w in grp:

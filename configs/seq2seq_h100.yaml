@@ -46,10 +46,12 @@ wandb_project: arabic-dexlit
 
 # With 80GB+ there is no reason to trade throughput for memory: checkpointing
 # costs roughly 30-40% speed to save memory that is not scarce here.
+# Measured on an H200: batch 72 at length 448 peaks at 120GB of 150GB, and 64
+# leaves headroom for the length outliers the synthetic probe does not contain.
 gradient_checkpointing: false
-batch_size: 128
-eval_batch_size: 128
-grad_accum: 2          # effective batch 256
+batch_size: 64
+eval_batch_size: 64
+grad_accum: 4          # effective batch 256
 # Scaled for the larger batch: 1e-4 was tuned for an effective batch of 64.
 learning_rate: 3.0e-4
 num_workers: 16

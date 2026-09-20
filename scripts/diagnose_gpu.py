@@ -108,6 +108,10 @@ def try_batch(model, tok, bs: int, length: int, device, amp_dtype, checkpointing
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     try:
+        # train() matters: HuggingFace skips gradient checkpointing entirely
+        # when the module is in eval mode, so without this both arms of the
+        # comparison silently measure the same thing.
+        model.train()
         model.gradient_checkpointing_enable() if checkpointing else model.gradient_checkpointing_disable()
         model.config.use_cache = not checkpointing
         batch = _batch(tok, model, bs, length, device)
@@ -143,6 +147,7 @@ def find_max_batch(model, tok, length: int, device, amp_dtype, checkpointing: bo
 def time_steps(model, tok, bs: int, length: int, device, amp_dtype, checkpointing: bool,
                iters: int = 12) -> tuple[float, float]:
     """Median seconds per step and peak memory, for a given configuration."""
+    model.train()
     model.gradient_checkpointing_enable() if checkpointing else model.gradient_checkpointing_disable()
     model.config.use_cache = not checkpointing
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
@@ -206,6 +211,10 @@ def main() -> None:
     info = gpu_report()
     device = torch.device("cuda")
     amp_dtype = torch.bfloat16 if info["bf16"] else torch.float16
+    # Match the trainer, otherwise the measured numbers do not transfer.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     from arabic_dexlit.model.seq2seq import Seq2SeqConfig
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
